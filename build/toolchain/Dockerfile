@@ -2,17 +2,19 @@
 #
 # The og-zed-toolchain image: Rust and the Android NDK on a digest-pinned Ubuntu, with packages from a dated Ubuntu
 # snapshot. build/zed.sh builds it with BASE_IMAGE and APT_SNAPSHOT from pins, in a context directory that holds the
-# sha256-checked Rust tarballs (+ .sha256), the NDK zip and Google's sha1 for it (ndk.sha1.google).
+# sha256-checked Rust tarballs (+ .sha256), the NDK zip, Google's sha1 for it (ndk.sha1.google) and host-ca.crt.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 ARG APT_SNAPSHOT
 
 USER root
 # build-essential: the host linker for build scripts and proc-macros; ca-certificates: `cargo fetch` over https;
-# unzip and xz-utils: unpacking the NDK and Rust below.
-RUN set -eu; \
-    apt-get update --snapshot "$APT_SNAPSHOT"; \
-    apt-get install -y --no-install-recommends --snapshot "$APT_SNAPSHOT" \
+# unzip and xz-utils: unpacking the NDK and Rust below. The base image has no CA certificates yet, so apt's https to
+# the snapshot server is verified against the build host's bundle (host-ca.crt, bind-mounted for this step only and
+# in no layer); the packages themselves are verified by apt against the Ubuntu archive key as always.
+RUN --mount=type=bind,source=host-ca.crt,target=/run/host-ca.crt set -eu; \
+    apt-get -o Acquire::https::CAInfo=/run/host-ca.crt update --snapshot "$APT_SNAPSHOT"; \
+    apt-get -o Acquire::https::CAInfo=/run/host-ca.crt install -y --no-install-recommends --snapshot "$APT_SNAPSHOT" \
         build-essential ca-certificates unzip xz-utils; \
     rm -rf /var/lib/apt/lists/*; \
     useradd -m builder

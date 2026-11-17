@@ -22,6 +22,8 @@
 # Environment: OG_ZED_CACHE (default ${XDG_CACHE_HOME:-~/.cache}/og-zed), OG_ZED_JOBS (default 4), OG_ZED_COLD=1 (a
 # fresh cargo home and target dir for this run, for measuring a cold build; removed afterwards).
 set -euo pipefail
+# Errors inside $(...) must stop the script too (bash drops -e in command substitutions otherwise).
+shopt -s inherit_errexit
 
 here=$(cd "$(dirname "$0")" && pwd)
 mod=$(dirname "$here")
@@ -132,6 +134,12 @@ toolchain_image() { # prints the image name, building it from pinned inputs if m
         echo "$RUST_STD_AARCH64_SHA256  rust-std-$RUST_VERSION-aarch64-linux-android.tar.xz" \
             > "$f/rust-std-$RUST_VERSION-aarch64-linux-android.tar.xz.sha256"
         echo "$NDK_ZIP_SHA1" > "$f/ndk.sha1.google"
+        local ca
+        for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem ""; do
+            [ -z "$ca" ] || [ -s "$ca" ] && break
+        done
+        [ -n "$ca" ] || die "no CA bundle on this host (needed for apt's https to the snapshot server)"
+        cp "$ca" "$f/host-ca.crt"
         log "building $img"
         # The only network use is apt, from the dated Ubuntu snapshot.
         docker build -q -t "$img" --build-arg BASE_IMAGE="$TOOLCHAIN_BASE_IMAGE" --build-arg APT_SNAPSHOT="$APT_SNAPSHOT" \
@@ -162,14 +170,15 @@ sandbox() { # <img> <src> <target dir> <cargo home> <cmd...>
 crates() { # <img> <src> <cargo home>: offline check first; the networked fetch only when something is missing
     local img=$1 src=$2 ch=$3
     mkdir -p "$ch/registry/index" "$ch/registry/cache" "$ch/registry/src" "$ch/git"
-    if sandbox "$img" "$src" "$(mktemp -d)" "$ch" cargo fetch --locked --offline \
-        --target x86_64-linux-android --target aarch64-linux-android > /dev/null 2>&1; then
+    # All platforms, not just the two targets: cargo build also needs the host-side packages of build scripts and
+    # proc-macros (alsa, for one, when the build host is Linux), which a --target-filtered fetch leaves out.
+    if sandbox "$img" "$src" "$(mktemp -d)" "$ch" cargo fetch --locked --offline > /dev/null 2>&1; then
         return
     fi
     log "cargo fetch --locked (network)"
     docker run --rm --cpus 4 --memory 8g --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
         -v "$src:/src:ro" -v "$ch:/cargo-home" -e CARGO_HOME=/cargo-home -e CARGO_NET_OFFLINE=false \
-        "$img" cargo fetch --locked --target x86_64-linux-android --target aarch64-linux-android
+        "$img" cargo fetch --locked
 }
 
 build_into() { # <abi> <img> <src> <cargo home> <target dir>: prints the built library

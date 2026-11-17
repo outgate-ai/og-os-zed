@@ -34,7 +34,7 @@ What `zed.sh` does:
 
 1. Downloads the upstream tag tarball and checks its sha256, and that its tree hashes to the tag's git tree.
 2. Applies `patches/` with `git am`, at fixed dates, and checks the patched `Cargo.lock` against this one.
-3. `cargo fetch --locked` for both Android targets: the only networked step. Cargo checks every crate against
+3. `cargo fetch --locked` (all platforms: build scripts run on the host): the only networked step. Cargo checks every crate against
    its `Cargo.lock` checksum; git dependencies are pinned by commit.
 4. Builds the `og-zed-toolchain` image from `build/toolchain/Dockerfile` (base image by digest, Ubuntu packages
    from a dated snapshot, Rust and NDK downloads checked against `build/pins`).
