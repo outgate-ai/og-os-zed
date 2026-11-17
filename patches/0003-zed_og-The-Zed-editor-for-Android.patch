@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OG OS <og-os@invalid>
+Date: Fri, 24 Apr 2026 21:41:32 +0000
+Subject: [PATCH 3/5] zed_og: The Zed editor for Android
+
+A cdylib entry point that runs the editor on gpui_android without network, AI,
+collaboration, terminal or language-server features, with settings and key bindings
+for a phone (Back, a docked project panel, the search bar) and codes-only logging.
+---
+ crates/zed_og/Cargo.toml    |  53 ++++++
+ crates/zed_og/LICENSE-GPL   |   1 +
+ crates/zed_og/src/zed_og.rs | 362 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 416 insertions(+)
+ create mode 100644 crates/zed_og/Cargo.toml
+ create mode 120000 crates/zed_og/LICENSE-GPL
+ create mode 100644 crates/zed_og/src/zed_og.rs
+
+diff --git a/crates/zed_og/Cargo.toml b/crates/zed_og/Cargo.toml
+new file mode 100644
+index 0000000..2b25d16
+--- /dev/null
++++ b/crates/zed_og/Cargo.toml
+@@ -0,0 +1,53 @@
++[package]
++name = "zed_og"
++version = "0.1.0"
++edition.workspace = true
++publish.workspace = true
++license = "GPL-3.0-or-later"
++
++[lints]
++workspace = true
++
++[lib]
++path = "src/zed_og.rs"
++crate-type = ["cdylib"]
++
++[target.'cfg(target_os = "android")'.dependencies]
++anyhow.workspace = true
++assets.workspace = true
++client.workspace = true
++command_palette.workspace = true
++command_palette_hooks.workspace = true
++db.workspace = true
++editor.workspace = true
++feature_flags.workspace = true
++file_finder.workspace = true
++fs.workspace = true
++go_to_line.workspace = true
++gpui.workspace = true
++gpui_android.workspace = true
++gpui_platform.workspace = true
++gpui_tokio.workspace = true
++http_client.workspace = true
++language.workspace = true
++languages.workspace = true
++libc.workspace = true
++log.workspace = true
++menu.workspace = true
++node_runtime.workspace = true
++outline.workspace = true
++paths.workspace = true
++project.workspace = true
++project_panel.workspace = true
++release_channel.workspace = true
++search.workspace = true
++session.workspace = true
++settings.workspace = true
++tab_switcher.workspace = true
++theme.workspace = true
++theme_settings.workspace = true
++ui_prompt.workspace = true
++util.workspace = true
++uuid.workspace = true
++workspace.workspace = true
++zed_actions.workspace = true
+diff --git a/crates/zed_og/LICENSE-GPL b/crates/zed_og/LICENSE-GPL
+new file mode 120000
+index 0000000..89e542f
+--- /dev/null
++++ b/crates/zed_og/LICENSE-GPL
+@@ -0,0 +1 @@
++../../LICENSE-GPL
+\ No newline at end of file
+diff --git a/crates/zed_og/src/zed_og.rs b/crates/zed_og/src/zed_og.rs
+new file mode 100644
+index 0000000..991c5ed
+--- /dev/null
++++ b/crates/zed_og/src/zed_og.rs
+@@ -0,0 +1,362 @@
++//! Zed for OG OS: the editor without collaboration, accounts, AI, extensions, the terminal, language servers or
++//! updates. The app has no network permission, and nothing here creates a network client.
++#![cfg(target_os = "android")]
++
++use std::{path::PathBuf, sync::Arc};
++
++use client::{Client, UserStore};
++use db::kvp::KeyValueStore;
++use fs::{Fs, RealFs};
++use gpui::{App, AppContext as _, Application, UpdateGlobal as _, WindowOptions};
++use gpui_android::AndroidApp;
++use http_client::BlockedHttpClient;
++use language::LanguageRegistry;
++use node_runtime::NodeRuntime;
++use project_panel::ProjectPanel;
++use session::{AppSession, Session};
++use settings::{KeymapFile, SettingsStore};
++use workspace::{AppState, OpenOptions, Workspace, WorkspaceStore};
++
++const OG_SETTINGS: &str = r#"{
++  "telemetry": { "diagnostics": false, "metrics": false },
++  "disable_ai": true,
++  "auto_update": false,
++  "enable_language_server": false,
++  "format_on_save": "off",
++  "use_system_prompts": false,
++  "gutter": { "runnables": false },
++  "auto_install_extensions": {},
++  "ui_font_size": 16,
++  "buffer_font_size": 15,
++  "restore_on_startup": "last_session",
++  "project_panel": { "dock": "left", "starts_open": false },
++  "file_finder": { "modal_max_width": "full" }
++}"#;
++
++// Namespaces of features this build never initialises; their actions must not show in the command palette.
++const HIDDEN_NAMESPACES: &[&str] = &[
++    "agent",
++    "assistant",
++    "auto_update",
++    "call",
++    "channel_modal",
++    "client",
++    "collab",
++    "copilot",
++    "edit_prediction",
++    "extensions",
++    "feedback",
++    "git_panel",
++    "language_models",
++    "terminal",
++    "git",
++    "zeta",
++];
++
++const SAMPLE_FILES: &[(&str, &str)] = &[
++    (
++        "README.md",
++        "# Zed (preview) on OG OS\n\nOpen files from the project panel, edit them and save with ctrl-s.\n",
++    ),
++    (
++        "src/main.rs",
++        "fn main() {\n    let greeting = \"hello from OG OS\";\n    println!(\"{greeting}\");\n}\n",
++    ),
++    (
++        "settings.json",
++        "{\n  \"theme\": \"One Dark\",\n  \"tab_size\": 4\n}\n",
++    ),
++];
++
++#[unsafe(no_mangle)]
++fn android_main(app: AndroidApp) {
++    silence_stdio();
++    let files_dir = app
++        .internal_data_path()
++        .expect("NativeActivity always has an internal data path");
++    let backend = wgpu_backend_override(&files_dir);
++    // SAFETY: setenv races with getenv in other threads. The only threads alive here are the JVM's and
++    // android-activity's (stdio forwarder, now at EOF); none of them read the environment. gpui_android and Zed
++    // start their threads after this block.
++    unsafe {
++        std::env::set_var("HOME", &files_dir);
++        std::env::set_var("TMPDIR", files_dir.join("tmp"));
++        if let Ok(Some(backend)) = backend {
++            std::env::set_var("WGPU_BACKEND", backend);
++        }
++    }
++    gpui_android::init(app);
++    if backend.is_err() {
++        log::error!("zed_og: E_WGPU_BACKEND");
++    }
++    paths::set_custom_data_dir(&files_dir.join("zed").to_string_lossy());
++    let project_dir = seed_sample_project(&files_dir);
++    run(project_dir);
++}
++
++/// A/B switch for the renderer: files/zed/wgpu-backend holding "vulkan" or "gl" picks the wgpu backend. Anything
++/// else (including NUL bytes, which would make set_var panic) is ignored with a code.
++fn wgpu_backend_override(files_dir: &std::path::Path) -> Result<Option<&'static str>, ()> {
++    let Ok(raw) = std::fs::read(files_dir.join("zed").join("wgpu-backend")) else {
++        return Ok(None);
++    };
++    let value: String = raw
++        .iter()
++        .map(|&b| b as char)
++        .filter(|c| !c.is_whitespace() && *c != '\0')
++        .collect();
++    match value.to_ascii_lowercase().as_str() {
++        "" => Ok(None),
++        "vulkan" => Ok(Some("vulkan")),
++        "gl" | "gles" => Ok(Some("gl")),
++        _ => Err(()),
++    }
++}
++
++/// android-activity forwards fds 1 and 2 to logcat unfiltered; point them at /dev/null so only the code-only `log`
++/// targets reach logcat (F10).
++fn silence_stdio() {
++    // SAFETY: plain libc calls on a path literal and the standard fds.
++    unsafe {
++        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
++        if null >= 0 {
++            libc::dup2(null, 1);
++            libc::dup2(null, 2);
++            libc::close(null);
++        }
++    }
++}
++
++fn seed_sample_project(files_dir: &std::path::Path) -> PathBuf {
++    let project_dir = files_dir.join("projects").join("sample");
++    if !project_dir.exists() {
++        for (relative, contents) in SAMPLE_FILES {
++            let path = project_dir.join(relative);
++            if let Some(parent) = path.parent() {
++                std::fs::create_dir_all(parent).ok();
++            }
++            if std::fs::write(&path, contents).is_err() {
++                log::error!("zed_og: E_SEED");
++            }
++        }
++    }
++    std::fs::create_dir_all(files_dir.join("tmp")).ok();
++    for dir in [
++        paths::config_dir(),
++        paths::data_dir(),
++        paths::database_dir(),
++    ] {
++        std::fs::create_dir_all(dir).ok();
++    }
++    project_dir
++}
++
++fn build_window_options(_display_uuid: Option<uuid::Uuid>, cx: &mut App) -> WindowOptions {
++    WindowOptions {
++        titlebar: None,
++        focus: true,
++        show: true,
++        window_background: theme::ActiveTheme::theme(cx).window_background_appearance(),
++        app_id: Some(
++            release_channel::ReleaseChannel::global(cx)
++                .app_id()
++                .to_owned(),
++        ),
++        ..Default::default()
++    }
++}
++
++fn run(project_dir: PathBuf) {
++    let app = Application::with_platform(gpui_platform::current_platform(false))
++        .with_assets(assets::Assets);
++
++    let app_db = db::AppDatabase::new();
++    let session = app.background_executor().spawn(Session::new(
++        uuid::Uuid::new_v4().to_string(),
++        KeyValueStore::from_app_db(&app_db),
++    ));
++    let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, app.background_executor()));
++
++    app.run(move |cx| {
++        cx.set_global(app_db);
++        zed_actions::init();
++        release_channel::init(
++            release_channel::AppVersion::load(env!("CARGO_PKG_VERSION"), None, None),
++            cx,
++        );
++        gpui_tokio::init(cx);
++        settings::init(cx);
++        let parsed = SettingsStore::update_global(cx, |store, cx| {
++            store.set_user_settings(OG_SETTINGS, cx).parse_status
++        });
++        if matches!(parsed, settings::ParseStatus::Failed { .. }) {
++            log::error!("zed_og: E_SETTINGS");
++        }
++        // No worktree is trusted, so project-local settings (.zed/settings.json) are not applied; the action that
++        // grants trust is unbound and hidden from the palette below.
++        project::trusted_worktrees::init(Default::default(), cx);
++
++        cx.set_http_client(Arc::new(BlockedHttpClient::new()));
++        <dyn Fs>::set_global(fs.clone(), cx);
++
++        let client = Client::production(cx);
++        let mut languages = LanguageRegistry::new(cx.background_executor().clone());
++        languages.set_language_server_download_dir(paths::languages_dir().clone());
++        let languages = Arc::new(languages);
++        let node_runtime = NodeRuntime::unavailable();
++        languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
++
++        let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
++        let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
++        Client::set_global(client.clone(), cx);
++        project::Project::init(&client, cx);
++        client::init(&client, cx);
++        feature_flags::FeatureFlagStore::init(cx);
++
++        let session = cx.foreground_executor().block_on(session);
++        let session = cx.new(|cx| AppSession::new(session, cx));
++        let app_state = Arc::new(AppState {
++            languages,
++            client,
++            user_store,
++            fs,
++            build_window_options,
++            workspace_store,
++            node_runtime,
++            session,
++        });
++        AppState::set_global(app_state.clone(), cx);
++
++        theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
++        command_palette::init(cx);
++        editor::init(cx);
++        workspace::init(app_state.clone(), cx);
++        ui_prompt::init(cx);
++        go_to_line::init(cx);
++        file_finder::init(cx);
++        tab_switcher::init(cx);
++        outline::init(cx);
++        project_panel::init(cx);
++        search::init(cx);
++
++        // The default keymap names actions this build leaves out (agent, collab, terminal): keep the rest, and log
++        // a code only, since the loader's error lists the missing actions.
++        match KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx) {
++            Ok(bindings) => cx.bind_keys(bindings.into_iter().filter(|binding| {
++                !binding
++                    .action()
++                    .as_any()
++                    .is::<workspace::ToggleWorktreeSecurity>()
++            })),
++            Err(_) => log::error!("zed_og: E_KEYMAP"),
++        }
++
++        // Android's Back arrives as an `android_back` keystroke. It answers an open prompt, closes a picker, menu or
++        // the editor's completion/code-action popup, dismisses the search bar (also when focus is back in the editor),
++        // and otherwise closes the workspace. With hot exit (restore_unsaved_buffers) dirty buffers are kept for the
++        // next launch instead of prompting. The deepest matching context wins; at equal depth the later binding wins,
++        // which is why the editor popup binding comes after menu::Cancel (the editor adds `menu` to its context while
++        // a popup is open but has no menu::Cancel handler).
++        cx.bind_keys([
++            gpui::KeyBinding::new("android_back", workspace::CloseWindow, Some("Workspace")),
++            gpui::KeyBinding::new(
++                "android_back",
++                search::buffer_search::Dismiss,
++                Some("BufferSearchBar || (Pane && buffer_search_deployed)"),
++            ),
++            gpui::KeyBinding::new(
++                "android_back",
++                menu::Cancel,
++                Some("Picker || menu || Prompt || GoToLine"),
++            ),
++            // The project panel always carries `menu` and its cancel does not propagate; outside a rename, Back
++            // returns focus to the editor instead (a later binding at the same depth wins).
++            gpui::KeyBinding::new(
++                "android_back",
++                zed_actions::project_panel::ToggleFocus,
++                Some("ProjectPanel && not_editing"),
++            ),
++            gpui::KeyBinding::new(
++                "android_back",
++                editor::actions::Cancel,
++                Some("Editor && (showing_completions || showing_code_actions)"),
++            ),
++        ]);
++
++        // Any close request goes through MultiWorkspace::close_window, which keeps or prompts for unsaved items and
++        // closes the window itself; gpui_android finishes the Activity once the window is gone.
++        cx.observe_new(|_: &mut workspace::MultiWorkspace, window, cx| {
++            let Some(window) = window else {
++                return;
++            };
++            let handle = cx.entity().downgrade();
++            window.on_window_should_close(cx, move |window, cx| {
++                handle
++                    .update(cx, |multi_workspace, cx| {
++                        multi_workspace.close_window(&workspace::CloseWindow, window, cx);
++                        false
++                    })
++                    .unwrap_or(true)
++            });
++        })
++        .detach();
++
++        command_palette_hooks::CommandPaletteFilter::update_global(cx, |filter, _| {
++            for namespace in HIDDEN_NAMESPACES {
++                filter.hide_namespace(namespace);
++            }
++            filter.hide_action_types(&[
++                std::any::TypeId::of::<workspace::ToggleWorktreeSecurity>(),
++                std::any::TypeId::of::<editor::actions::AcceptEditPrediction>(),
++                std::any::TypeId::of::<editor::actions::AcceptNextWordEditPrediction>(),
++                std::any::TypeId::of::<editor::actions::AcceptNextLineEditPrediction>(),
++            ]);
++        });
++
++        cx.observe_new(|workspace: &mut Workspace, window, cx| {
++            let Some(window) = window else {
++                return;
++            };
++            let center_pane = workspace.active_pane().clone();
++            add_search_bar(workspace, &center_pane, window, cx);
++            let handle = cx.entity();
++            cx.subscribe_in(&handle, window, |workspace, _, event, window, cx| {
++                if let workspace::Event::PaneAdded(pane) = event {
++                    add_search_bar(workspace, pane, window, cx);
++                }
++            })
++            .detach();
++            cx.spawn_in(window, async move |workspace, cx| {
++                let panel = ProjectPanel::load(workspace.clone(), cx.clone()).await?;
++                workspace.update_in(cx, |workspace, window, cx| {
++                    workspace.add_panel(panel, window, cx);
++                })
++            })
++            .detach();
++        })
++        .detach();
++
++        let open = workspace::open_paths(&[project_dir], app_state, OpenOptions::default(), cx);
++        cx.spawn(async move |_| {
++            if open.await.is_err() {
++                log::error!("zed_og: E_OPEN_PROJECT");
++            }
++        })
++        .detach();
++    });
++}
++
++fn add_search_bar(
++    workspace: &Workspace,
++    pane: &gpui::Entity<workspace::Pane>,
++    window: &mut gpui::Window,
++    cx: &mut gpui::Context<Workspace>,
++) {
++    let languages = workspace.project().read(cx).languages().clone();
++    pane.update(cx, |pane, cx| {
++        pane.toolbar().update(cx, |toolbar, cx| {
++            let search_bar = cx.new(|cx| search::BufferSearchBar::new(Some(languages), window, cx));
++            toolbar.add_item(search_bar, window, cx);
++        });
++    });
++}

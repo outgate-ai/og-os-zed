@@ -1,0 +1,736 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OG OS <og-os@invalid>
+Date: Fri, 24 Apr 2026 21:41:32 +0000
+Subject: [PATCH 2/5] Build the editor crates for Android
+
+cfg(target_os = "android") where the desktop code assumes a desktop: file watching, paths,
+spawning processes (refused on Android), the default keymap and settings, and
+workspace close handling.
+---
+ crates/client/src/telemetry.rs                |  9 ++
+ crates/command_palette/src/command_palette.rs |  1 +
+ crates/fs/Cargo.toml                          |  2 +
+ crates/fs/src/fs.rs                           | 65 ++++++++++----
+ crates/fs/src/fs_watcher.rs                   |  6 +-
+ crates/git_ui/Cargo.toml                      |  4 +-
+ crates/git_ui/src/git_panel.rs                | 88 +++++++++++--------
+ crates/go_to_line/src/go_to_line.rs           |  1 +
+ crates/language/Cargo.toml                    |  3 +
+ crates/language/src/language.rs               |  7 +-
+ crates/language/src/language_registry.rs      | 17 +++-
+ crates/languages/src/python.rs                | 14 +++
+ crates/languages/src/rust.rs                  |  7 ++
+ crates/paths/src/paths.rs                     | 24 ++++-
+ crates/settings/src/vscode_import.rs          |  2 +-
+ crates/util/src/command.rs                    | 34 ++++++-
+ crates/util/src/shell_env.rs                  | 11 ++-
+ crates/workspace/src/modal_layer.rs           |  2 +
+ 18 files changed, 229 insertions(+), 68 deletions(-)
+
+diff --git a/crates/client/src/telemetry.rs b/crates/client/src/telemetry.rs
+index 58681d2..26f3510 100644
+--- a/crates/client/src/telemetry.rs
++++ b/crates/client/src/telemetry.rs
+@@ -121,10 +121,19 @@ pub fn os_name() -> String {
+     {
+         "Windows".to_string()
+     }
++
++    #[cfg(target_os = "android")]
++    {
++        "Android".to_string()
++    }
+ }
+ 
+ /// Note: This might do blocking IO! Only call from background threads
+ pub fn os_version() -> String {
++    #[cfg(target_os = "android")]
++    {
++        String::new()
++    }
+     #[cfg(target_os = "macos")]
+     {
+         use objc2_foundation::NSProcessInfo;
+diff --git a/crates/command_palette/src/command_palette.rs b/crates/command_palette/src/command_palette.rs
+index 4a80740..c4fb7ea 100644
+--- a/crates/command_palette/src/command_palette.rs
++++ b/crates/command_palette/src/command_palette.rs
+@@ -155,6 +155,7 @@ impl Render for CommandPalette {
+         v_flex()
+             .key_context("CommandPalette")
+             .w(rems(34.))
++            .max_w_full()
+             .child(self.picker.clone())
+     }
+ }
+diff --git a/crates/fs/Cargo.toml b/crates/fs/Cargo.toml
+index e7b8dcd..c84b6ae 100644
+--- a/crates/fs/Cargo.toml
++++ b/crates/fs/Cargo.toml
+@@ -42,6 +42,8 @@ time.workspace = true
+ util.workspace = true
+ is_executable = "1.0.5"
+ notify = "8.2.0"
++
++[target.'cfg(not(target_os = "android"))'.dependencies]
+ trash = { git = "https://github.com/zed-industries/trash-rs", rev = "3bf27effd4eb8699f2e484d3326b852fe3e53af7" }
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+diff --git a/crates/fs/src/fs.rs b/crates/fs/src/fs.rs
+index fa42c43..1757456 100644
+--- a/crates/fs/src/fs.rs
++++ b/crates/fs/src/fs.rs
+@@ -197,6 +197,7 @@ pub struct TrashedEntry {
+     pub original_parent: PathBuf,
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ impl From<trash::TrashItem> for TrashedEntry {
+     fn from(item: trash::TrashItem) -> Self {
+         Self {
+@@ -207,6 +208,7 @@ impl From<trash::TrashItem> for TrashedEntry {
+     }
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ impl TrashedEntry {
+     fn into_trash_item(self) -> trash::TrashItem {
+         trash::TrashItem {
+@@ -230,6 +232,7 @@ pub enum TrashRestoreError {
+     Unknown { description: String },
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ impl From<trash::Error> for TrashRestoreError {
+     fn from(err: trash::Error) -> Self {
+         match err {
+@@ -426,7 +429,7 @@ impl FileHandle for std::fs::File {
+         Ok(path)
+     }
+ 
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     fn current_path(&self, _: &Arc<dyn Fs>) -> Result<PathBuf> {
+         let fd = self.as_fd();
+         let fd_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+@@ -552,7 +555,7 @@ impl RealFs {
+     }
+ }
+ 
+-#[cfg(any(target_os = "macos", target_os = "linux"))]
++#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+ fn rename_without_replace(source: &Path, target: &Path) -> io::Result<()> {
+     let source = path_to_c_string(source)?;
+     let target = path_to_c_string(target)?;
+@@ -560,7 +563,7 @@ fn rename_without_replace(source: &Path, target: &Path) -> io::Result<()> {
+     #[cfg(target_os = "macos")]
+     let result = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+ 
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     let result = unsafe {
+         libc::syscall(
+             libc::SYS_renameat2,
+@@ -599,7 +602,7 @@ fn rename_without_replace(source: &Path, target: &Path) -> io::Result<()> {
+     .map_err(|_| io::Error::last_os_error())
+ }
+ 
+-#[cfg(any(target_os = "macos", target_os = "linux"))]
++#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+ fn path_to_c_string(path: &Path) -> io::Result<CString> {
+     CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+         io::Error::new(
+@@ -703,7 +706,12 @@ impl Fs for RealFs {
+         }
+ 
+         let use_metadata_fallback = {
+-            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
++            #[cfg(any(
++                target_os = "macos",
++                target_os = "linux",
++                target_os = "android",
++                target_os = "windows"
++            ))]
+             {
+                 let source = source.to_path_buf();
+                 let target = target.to_path_buf();
+@@ -736,7 +744,12 @@ impl Fs for RealFs {
+                 }
+             }
+ 
+-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
++            #[cfg(not(any(
++                target_os = "macos",
++                target_os = "linux",
++                target_os = "android",
++                target_os = "windows"
++            )))]
+             {
+                 // For platforms which do not have an atomic no-overwrite rename yet.
+                 true
+@@ -805,12 +818,21 @@ impl Fs for RealFs {
+             .await
+             .context("Could not canonicalize the path of the file")?;
+ 
++        #[cfg(target_os = "android")]
++        {
++            let _ = path;
++            anyhow::bail!("there is no system trash on Android")
++        }
++
++        #[cfg(not(target_os = "android"))]
+         let (tx, rx) = futures::channel::oneshot::channel();
++        #[cfg(not(target_os = "android"))]
+         std::thread::Builder::new()
+             .name("trash file or dir".to_string())
+             .spawn(|| tx.send(trash::delete_with_info(path)))
+             .expect("The os can spawn threads");
+ 
++        #[cfg(not(target_os = "android"))]
+         Ok(rx
+             .await
+             .context("Tx dropped or fs.restore panicked")?
+@@ -1270,20 +1292,31 @@ impl Fs for RealFs {
+     ) -> std::result::Result<PathBuf, TrashRestoreError> {
+         let restored_item_path = trashed_entry.original_parent.join(&trashed_entry.name);
+ 
+-        let (tx, rx) = futures::channel::oneshot::channel();
+-        std::thread::Builder::new()
+-            .name("restore trashed item".to_string())
+-            .spawn(move || {
+-                let res = trash::restore_all([trashed_entry.into_trash_item()]);
+-                tx.send(res)
++        #[cfg(target_os = "android")]
++        {
++            let _ = restored_item_path;
++            Err(TrashRestoreError::NotFound {
++                path: trashed_entry.original_parent,
+             })
+-            .expect("The OS can spawn a threads");
+-        rx.await.expect("Restore all never panics")?;
+-        Ok(restored_item_path)
++        }
++
++        #[cfg(not(target_os = "android"))]
++        {
++            let (tx, rx) = futures::channel::oneshot::channel();
++            std::thread::Builder::new()
++                .name("restore trashed item".to_string())
++                .spawn(move || {
++                    let res = trash::restore_all([trashed_entry.into_trash_item()]);
++                    tx.send(res)
++                })
++                .expect("The OS can spawn a threads");
++            rx.await.expect("Restore all never panics")?;
++            Ok(restored_item_path)
++        }
+     }
+ }
+ 
+-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
++#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+ impl Watcher for RealWatcher {
+     fn add(&self, _: &Path) -> Result<()> {
+         Ok(())
+diff --git a/crates/fs/src/fs_watcher.rs b/crates/fs/src/fs_watcher.rs
+index 02a6b08..0adf57c 100644
+--- a/crates/fs/src/fs_watcher.rs
++++ b/crates/fs/src/fs_watcher.rs
+@@ -71,7 +71,7 @@ impl Watcher for FsWatcher {
+                 return Ok(());
+             }
+         }
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "android"))]
+         {
+             if self.registrations.lock().contains_key(path) {
+                 log::trace!("path to watch is already watched: {path:?}");
+@@ -84,7 +84,7 @@ impl Watcher for FsWatcher {
+ 
+         #[cfg(any(target_os = "windows", target_os = "macos"))]
+         let mode = notify::RecursiveMode::Recursive;
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "android"))]
+         let mode = notify::RecursiveMode::NonRecursive;
+ 
+         let registration_path = path.clone();
+@@ -230,7 +230,7 @@ pub struct GlobalWatcher {
+ 
+     // DANGER: never keep the state lock while holding the watcher lock
+     // two mutexes because calling watcher.add triggers an watcher.event, which needs watchers.
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     watcher: Mutex<notify::INotifyWatcher>,
+     #[cfg(target_os = "freebsd")]
+     watcher: Mutex<notify::KqueueWatcher>,
+diff --git a/crates/git_ui/Cargo.toml b/crates/git_ui/Cargo.toml
+index d4ea54e..07c5bdb 100644
+--- a/crates/git_ui/Cargo.toml
++++ b/crates/git_ui/Cargo.toml
+@@ -21,7 +21,6 @@ alacritty_terminal.workspace = true
+ anyhow.workspace = true
+ askpass.workspace = true
+ buffer_diff.workspace = true
+-call.workspace = true
+ collections.workspace = true
+ component.workspace = true
+ db.workspace = true
+@@ -70,6 +69,9 @@ zed_actions.workspace = true
+ zeroize.workspace = true
+ ztracing.workspace = true
+ tracing.workspace = true
++[target.'cfg(not(target_os = "android"))'.dependencies]
++call.workspace = true
++
+ [target.'cfg(windows)'.dependencies]
+ windows.workspace = true
+ 
+diff --git a/crates/git_ui/src/git_panel.rs b/crates/git_ui/src/git_panel.rs
+index 77818ce..8b50d73 100644
+--- a/crates/git_ui/src/git_panel.rs
++++ b/crates/git_ui/src/git_panel.rs
+@@ -3304,46 +3304,56 @@ impl GitPanel {
+     }
+ 
+     fn potential_co_authors(&self, cx: &App) -> Vec<(String, String)> {
+-        let mut new_co_authors = Vec::new();
++        let mut new_co_authors: Vec<(String, String)> = Vec::new();
+         let project = self.project.read(cx);
+ 
++        #[cfg(target_os = "android")]
++        {
++            let _ = (&mut new_co_authors, project);
++            return Vec::default();
++        }
++
++        #[cfg(not(target_os = "android"))]
+         let Some(room) =
+             call::ActiveCall::try_global(cx).and_then(|call| call.read(cx).room().cloned())
+         else {
+             return Vec::default();
+         };
++        #[cfg(not(target_os = "android"))]
++        {
++            let room = room.read(cx);
+ 
+-        let room = room.read(cx);
+-
+-        for (peer_id, collaborator) in project.collaborators() {
+-            if collaborator.is_host {
+-                continue;
+-            }
++            for (peer_id, collaborator) in project.collaborators() {
++                if collaborator.is_host {
++                    continue;
++                }
+ 
+-            let Some(participant) = room.remote_participant_for_peer_id(*peer_id) else {
+-                continue;
+-            };
+-            if !participant.can_write() {
+-                continue;
++                let Some(participant) = room.remote_participant_for_peer_id(*peer_id) else {
++                    continue;
++                };
++                if !participant.can_write() {
++                    continue;
++                }
++                if let Some(email) = &collaborator.committer_email {
++                    let name = collaborator
++                        .committer_name
++                        .clone()
++                        .or_else(|| participant.user.name.clone())
++                        .unwrap_or_else(|| participant.user.github_login.clone().to_string());
++                    new_co_authors.push((name.clone(), email.clone()))
++                }
+             }
+-            if let Some(email) = &collaborator.committer_email {
+-                let name = collaborator
+-                    .committer_name
+-                    .clone()
+-                    .or_else(|| participant.user.name.clone())
+-                    .unwrap_or_else(|| participant.user.github_login.clone().to_string());
+-                new_co_authors.push((name.clone(), email.clone()))
++            if !project.is_local()
++                && !project.is_read_only(cx)
++                && let Some(local_committer) = self.local_committer(room, cx)
++            {
++                new_co_authors.push(local_committer);
+             }
++            new_co_authors
+         }
+-        if !project.is_local()
+-            && !project.is_read_only(cx)
+-            && let Some(local_committer) = self.local_committer(room, cx)
+-        {
+-            new_co_authors.push(local_committer);
+-        }
+-        new_co_authors
+     }
+ 
++    #[cfg(not(target_os = "android"))]
+     fn local_committer(&self, room: &call::Room, cx: &App) -> Option<(String, String)> {
+         let user = room.local_participant_user(cx)?;
+         let committer = self.local_committer.as_ref()?;
+@@ -5657,19 +5667,23 @@ impl Render for GitPanel {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+         let project = self.project.read(cx);
+         let has_entries = !self.entries.is_empty();
+-        let room = self.workspace.upgrade().and_then(|_workspace| {
+-            call::ActiveCall::try_global(cx).and_then(|call| call.read(cx).room().cloned())
+-        });
+-
+         let has_write_access = self.has_write_access(cx);
+ 
+-        let has_co_authors = room.is_some_and(|room| {
+-            self.load_local_committer(cx);
+-            let room = room.read(cx);
+-            room.remote_participants()
+-                .values()
+-                .any(|remote_participant| remote_participant.can_write())
+-        });
++        #[cfg(target_os = "android")]
++        let has_co_authors = false;
++        #[cfg(not(target_os = "android"))]
++        let has_co_authors = {
++            let room = self.workspace.upgrade().and_then(|_workspace| {
++                call::ActiveCall::try_global(cx).and_then(|call| call.read(cx).room().cloned())
++            });
++            room.is_some_and(|room| {
++                self.load_local_committer(cx);
++                let room = room.read(cx);
++                room.remote_participants()
++                    .values()
++                    .any(|remote_participant| remote_participant.can_write())
++            })
++        };
+ 
+         v_flex()
+             .id("git_panel")
+diff --git a/crates/go_to_line/src/go_to_line.rs b/crates/go_to_line/src/go_to_line.rs
+index 561d6a7..dc4c1cd 100644
+--- a/crates/go_to_line/src/go_to_line.rs
++++ b/crates/go_to_line/src/go_to_line.rs
+@@ -329,6 +329,7 @@ impl Render for GoToLine {
+ 
+         v_flex()
+             .w(rems(24.))
++            .max_w_full()
+             .elevation_2(cx)
+             .key_context("GoToLine")
+             .on_action(cx.listener(Self::cancel))
+diff --git a/crates/language/Cargo.toml b/crates/language/Cargo.toml
+index 1392ed6..7c353c3 100644
+--- a/crates/language/Cargo.toml
++++ b/crates/language/Cargo.toml
+@@ -76,6 +76,9 @@ zlog.workspace = true
+ ztracing.workspace = true
+ diffy = "0.4.2"
+ 
++[target.'cfg(not(target_os = "android"))'.dependencies]
++tree-sitter = { workspace = true, features = ["wasm"] }
++
+ [dev-dependencies]
+ collections = { workspace = true, features = ["test-support"] }
+ ctor.workspace = true
+diff --git a/crates/language/src/language.rs b/crates/language/src/language.rs
+index 43bbe7a..5e49bfd 100644
+--- a/crates/language/src/language.rs
++++ b/crates/language/src/language.rs
+@@ -84,7 +84,9 @@ pub use toolchain::{
+     LanguageToolchainStore, LocalLanguageToolchainStore, Toolchain, ToolchainList, ToolchainLister,
+     ToolchainMetadata, ToolchainScope,
+ };
+-use tree_sitter::{self, QueryCursor, WasmStore, wasmtime};
++use tree_sitter::{self, QueryCursor};
++#[cfg(not(target_os = "android"))]
++use tree_sitter::{WasmStore, wasmtime};
+ use util::rel_path::RelPath;
+ 
+ pub use buffer::Operation;
+@@ -122,7 +124,9 @@ where
+     F: FnOnce(&mut Parser) -> R,
+ {
+     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
++        #[allow(unused_mut)]
+         let mut parser = Parser::new();
++        #[cfg(not(target_os = "android"))]
+         parser
+             .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
+             .unwrap();
+@@ -142,6 +146,7 @@ where
+     func(cursor.deref_mut())
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
+     wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
+ });
+diff --git a/crates/language/src/language_registry.rs b/crates/language/src/language_registry.rs
+index 2ac6ef4..8db72fb 100644
+--- a/crates/language/src/language_registry.rs
++++ b/crates/language/src/language_registry.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
+     LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ToolchainLister,
+-    language_settings::all_language_settings, task_context::ContextProvider, with_parser,
++    language_settings::all_language_settings, task_context::ContextProvider,
+ };
+ use anyhow::{Context as _, Result, anyhow};
+ use collections::{FxHashMap, HashMap, HashSet, hash_map};
+@@ -983,12 +983,23 @@ impl LanguageRegistry {
+                                     .file_stem()
+                                     .and_then(OsStr::to_str)
+                                     .context("invalid grammar filename")?;
+-                                anyhow::Ok(with_parser(|parser| {
++                                #[cfg(not(target_os = "android"))]
++                                let grammar = crate::with_parser(|parser| {
+                                     let mut store = parser.take_wasm_store().unwrap();
+                                     let grammar = store.load_language(grammar_name, &wasm_bytes);
+                                     parser.set_wasm_store(store).unwrap();
+                                     grammar
+-                                })?)
++                                })?;
++                                #[cfg(target_os = "android")]
++                                let grammar: Result<
++                                    tree_sitter::Language,
++                                > = {
++                                    let _ = (wasm_bytes, grammar_name);
++                                    Err(anyhow!("wasm grammars are not supported on Android"))
++                                };
++                                #[cfg(target_os = "android")]
++                                let grammar = grammar?;
++                                anyhow::Ok(grammar)
+                             })
+                             .map_err(Arc::new);
+ 
+diff --git a/crates/languages/src/python.rs b/crates/languages/src/python.rs
+index d27db37..a5c4af7 100644
+--- a/crates/languages/src/python.rs
++++ b/crates/languages/src/python.rs
+@@ -254,6 +254,13 @@ impl TyLspAdapter {
+     const ARCH_SERVER_NAME: &str = "unknown-linux-gnu";
+ }
+ 
++// Language servers are off on Android (zed_og); these only keep the download code compiling.
++#[cfg(target_os = "android")]
++impl TyLspAdapter {
++    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
++    const ARCH_SERVER_NAME: &str = "unknown-linux-android";
++}
++
+ #[cfg(target_os = "freebsd")]
+ impl TyLspAdapter {
+     const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
+@@ -2371,6 +2378,13 @@ impl RuffLspAdapter {
+     const ARCH_SERVER_NAME: &str = "unknown-linux-gnu";
+ }
+ 
++// Language servers are off on Android (zed_og); these only keep the download code compiling.
++#[cfg(target_os = "android")]
++impl RuffLspAdapter {
++    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
++    const ARCH_SERVER_NAME: &str = "unknown-linux-android";
++}
++
+ #[cfg(target_os = "freebsd")]
+ impl RuffLspAdapter {
+     const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
+diff --git a/crates/languages/src/rust.rs b/crates/languages/src/rust.rs
+index d92c139..db5800f 100644
+--- a/crates/languages/src/rust.rs
++++ b/crates/languages/src/rust.rs
+@@ -55,6 +55,13 @@ impl RustLspAdapter {
+     const ARCH_SERVER_NAME: &str = "unknown-linux";
+ }
+ 
++// Language servers are off on Android (zed_og); these only keep the download code compiling.
++#[cfg(target_os = "android")]
++impl RustLspAdapter {
++    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
++    const ARCH_SERVER_NAME: &str = "unknown-linux-android";
++}
++
+ #[cfg(target_os = "freebsd")]
+ impl RustLspAdapter {
+     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
+diff --git a/crates/paths/src/paths.rs b/crates/paths/src/paths.rs
+index c9b9c75..d0e1335 100644
+--- a/crates/paths/src/paths.rs
++++ b/crates/paths/src/paths.rs
+@@ -85,7 +85,11 @@ pub fn config_dir() -> &'static PathBuf {
+             dirs::config_dir()
+                 .expect("failed to determine RoamingAppData directory")
+                 .join("Zed")
+-        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
++        } else if cfg!(any(
++            target_os = "linux",
++            target_os = "android",
++            target_os = "freebsd"
++        )) {
+             if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
+                 flatpak_xdg_config.into()
+             } else {
+@@ -105,7 +109,11 @@ pub fn data_dir() -> &'static PathBuf {
+             custom_dir.clone()
+         } else if cfg!(target_os = "macos") {
+             home_dir().join("Library/Application Support/Zed")
+-        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
++        } else if cfg!(any(
++            target_os = "linux",
++            target_os = "android",
++            target_os = "freebsd"
++        )) {
+             if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
+                 flatpak_xdg_data.into()
+             } else {
+@@ -129,7 +137,11 @@ pub fn state_dir() -> &'static PathBuf {
+             return home_dir().join(".local").join("state").join("Zed");
+         }
+ 
+-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
++        if cfg!(any(
++            target_os = "linux",
++            target_os = "android",
++            target_os = "freebsd"
++        )) {
+             return if let Ok(flatpak_xdg_state) = std::env::var("FLATPAK_XDG_STATE_HOME") {
+                 flatpak_xdg_state.into()
+             } else {
+@@ -161,7 +173,11 @@ pub fn temp_dir() -> &'static PathBuf {
+                 .join("Zed");
+         }
+ 
+-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
++        if cfg!(any(
++            target_os = "linux",
++            target_os = "android",
++            target_os = "freebsd"
++        )) {
+             return if let Ok(flatpak_xdg_cache) = std::env::var("FLATPAK_XDG_CACHE_HOME") {
+                 flatpak_xdg_cache.into()
+             } else {
+diff --git a/crates/settings/src/vscode_import.rs b/crates/settings/src/vscode_import.rs
+index 0913f1d..94c1931 100644
+--- a/crates/settings/src/vscode_import.rs
++++ b/crates/settings/src/vscode_import.rs
+@@ -904,7 +904,7 @@ impl VsCodeSettings {
+     fn project_terminal_settings_content(&self) -> ProjectTerminalSettingsContent {
+         #[cfg(target_os = "windows")]
+         let platform = "windows";
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "android"))]
+         let platform = "linux";
+         #[cfg(target_os = "macos")]
+         let platform = "osx";
+diff --git a/crates/util/src/command.rs b/crates/util/src/command.rs
+index a131d3c..f699c84 100644
+--- a/crates/util/src/command.rs
++++ b/crates/util/src/command.rs
+@@ -24,11 +24,34 @@ pub fn new_std_command(program: impl AsRef<OsStr>) -> std::process::Command {
+     command
+ }
+ 
+-#[cfg(not(target_os = "windows"))]
++#[cfg(not(any(target_os = "windows", target_os = "android")))]
+ pub fn new_std_command(program: impl AsRef<OsStr>) -> std::process::Command {
+     std::process::Command::new(program)
+ }
+ 
++/// The Android app never runs other programs (language servers, formatters, git, tasks): project content could
++/// name any binary. The returned command can only fail: its program is a path that cannot exist.
++#[cfg(target_os = "android")]
++pub fn new_std_command(program: impl AsRef<OsStr>) -> std::process::Command {
++    let _ = program;
++    log::warn!(target: "zed_og", "E_SPAWN_BLOCKED");
++    let mut command = std::process::Command::new(SPAWN_BLOCKED);
++    command.env_clear();
++    command
++}
++
++#[cfg(target_os = "android")]
++const SPAWN_BLOCKED: &str = "/dev/null/spawn-blocked";
++
++#[cfg(target_os = "android")]
++fn spawn_blocked() -> std::io::Error {
++    log::warn!(target: "zed_og", "E_SPAWN_BLOCKED");
++    std::io::Error::new(
++        std::io::ErrorKind::PermissionDenied,
++        "running programs is disabled on Android",
++    )
++}
++
+ #[cfg(not(target_os = "macos"))]
+ pub type Child = smol::process::Child;
+ 
+@@ -123,14 +146,23 @@ impl Command {
+     }
+ 
+     pub fn spawn(&mut self) -> std::io::Result<Child> {
++        #[cfg(target_os = "android")]
++        return Err(spawn_blocked());
++        #[cfg(not(target_os = "android"))]
+         self.0.spawn()
+     }
+ 
+     pub async fn output(&mut self) -> std::io::Result<std::process::Output> {
++        #[cfg(target_os = "android")]
++        return Err(spawn_blocked());
++        #[cfg(not(target_os = "android"))]
+         self.0.output().await
+     }
+ 
+     pub async fn status(&mut self) -> std::io::Result<std::process::ExitStatus> {
++        #[cfg(target_os = "android")]
++        return Err(spawn_blocked());
++        #[cfg(not(target_os = "android"))]
+         self.0.status().await
+     }
+ 
+diff --git a/crates/util/src/shell_env.rs b/crates/util/src/shell_env.rs
+index d12c352..067a1f4 100644
+--- a/crates/util/src/shell_env.rs
++++ b/crates/util/src/shell_env.rs
+@@ -1,3 +1,6 @@
++// Android takes the early return in capture(); the login-shell helpers stay compiled but unused there.
++#![cfg_attr(target_os = "android", allow(dead_code, unused_imports))]
++
+ use std::path::Path;
+ 
+ use anyhow::{Context as _, Result};
+@@ -32,9 +35,15 @@ pub async fn capture(
+     args: &[String],
+     directory: impl AsRef<Path>,
+ ) -> Result<collections::HashMap<String, String>> {
++    // An Android app cannot re-execute itself (current_exe is app_process64), so there is no login shell to ask.
++    #[cfg(target_os = "android")]
++    {
++        let _ = (shell_path, args, directory);
++        return Ok(std::env::vars().collect());
++    }
+     #[cfg(windows)]
+     return capture_windows(shell_path.as_ref(), args, directory.as_ref()).await;
+-    #[cfg(unix)]
++    #[cfg(all(unix, not(target_os = "android")))]
+     return capture_unix(shell_path.as_ref(), args, directory.as_ref()).await;
+ }
+ 
+diff --git a/crates/workspace/src/modal_layer.rs b/crates/workspace/src/modal_layer.rs
+index cb6f212..acc7921 100644
+--- a/crates/workspace/src/modal_layer.rs
++++ b/crates/workspace/src/modal_layer.rs
+@@ -241,11 +241,13 @@ impl Render for ModalLayer {
+             .child(
+                 v_flex()
+                     .h(px(0.0))
++                    .w_full()
+                     .top_20()
+                     .items_center()
+                     .track_focus(&active_modal.focus_handle)
+                     .child(
+                         h_flex()
++                            .max_w_full()
+                             .occlude()
+                             .child(active_modal.modal.view())
+                             .on_mouse_down(MouseButton::Left, |_, _, cx| {

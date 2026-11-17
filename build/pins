@@ -1,0 +1,24 @@
+# Inputs of the libzed_og.so build (zed.sh). Shell syntax: zed.sh sources this file.
+# Upstream Zed: the GitHub tag tarball; its extracted tree must also hash to the tag's git tree.
+ZED_TAG=v0.233.10
+ZED_TAG_COMMIT=350f33871e84d5ed83a403523e9490b9bf014a94
+ZED_TAG_TREE=a2c0a7964e212f11ed6e8198e51b739ce7f48c76
+ZED_TARBALL_URL=https://github.com/zed-industries/zed/archive/refs/tags/v0.233.10.tar.gz
+# Set from `zed.sh --pin` (which checks the download against ZED_TAG_TREE); zed.sh refuses to fetch until then.
+ZED_TARBALL_SHA256=PIN-ME
+# The tag's commit time: SOURCE_DATE_EPOCH for build scripts, and the date of the base commit the patches apply to.
+SOURCE_DATE_EPOCH=1777066892
+# Toolchain (the og-zed-toolchain image, toolchain/Dockerfile): Rust from static.rust-lang.org, sha256s
+# copied from its <file>.sha256; the NDK from Google, sha256 of the zip and Google's published sha1.
+RUST_VERSION=1.94.1
+RUST_DIST_URL=https://static.rust-lang.org/dist
+RUST_HOST_SHA256=294b3d81fa72e62581276290c60c81eb8b58498d333d422ca1dfc432877d0c40
+RUST_STD_X86_64_SHA256=64ec4125e527ef7fce883dfce807d394a7a149a23bb208e650afc7826a3bb805
+RUST_STD_AARCH64_SHA256=5362011f1e767aeacc5b95078afc54e781311d8be8b0900dde309a78f52de9bb
+NDK_VERSION=r30
+NDK_URL=https://dl.google.com/android/repository/android-ndk-r30-linux.zip
+NDK_ZIP_SHA256=753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2
+NDK_ZIP_SHA1=5107f898313790e449e87eee2183d9a20602dee9
+# The image's base, by digest, and the Ubuntu snapshot (snapshot.ubuntu.com) its few packages come from.
+TOOLCHAIN_BASE_IMAGE=docker.io/library/ubuntu:24.04@sha256:PIN-ME
+APT_SNAPSHOT=PIN-ME

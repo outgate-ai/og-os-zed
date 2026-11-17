@@ -1,0 +1,3497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OG OS <og-os@invalid>
+Date: Fri, 24 Apr 2026 21:41:32 +0000
+Subject: [PATCH 1/5] gpui: An Android platform (gpui_android)
+
+A GPUI platform for Android on android-activity's NativeActivity: the wgpu renderer
+(Vulkan, or GLES), touch and hardware-keyboard input, the soft keyboard through an
+InputConnection, the system clipboard, window insets and Back. gpui, gpui_platform and
+gpui_wgpu learn the android target.
+---
+ crates/gpui/src/gpui.rs                       |  14 +-
+ crates/gpui_android/Cargo.toml                |  34 +
+ crates/gpui_android/LICENSE-APACHE            |   1 +
+ crates/gpui_android/examples/android_input.rs | 776 +++++++++++++++++
+ crates/gpui_android/src/dispatcher.rs         | 193 +++++
+ crates/gpui_android/src/display.rs            |  41 +
+ crates/gpui_android/src/gpui_android.rs       |  42 +
+ crates/gpui_android/src/ime.rs                | 182 ++++
+ crates/gpui_android/src/input.rs              | 496 +++++++++++
+ crates/gpui_android/src/logging.rs            |  22 +
+ crates/gpui_android/src/platform.rs           | 781 ++++++++++++++++++
+ crates/gpui_android/src/window.rs             | 585 +++++++++++++
+ crates/gpui_platform/Cargo.toml               |   3 +
+ crates/gpui_platform/src/gpui_platform.rs     |   8 +
+ crates/gpui_wgpu/src/wgpu_context.rs          |  40 +-
+ crates/gpui_wgpu/src/wgpu_renderer.rs         |  44 +-
+ 16 files changed, 3243 insertions(+), 19 deletions(-)
+ create mode 100644 crates/gpui_android/Cargo.toml
+ create mode 120000 crates/gpui_android/LICENSE-APACHE
+ create mode 100644 crates/gpui_android/examples/android_input.rs
+ create mode 100644 crates/gpui_android/src/dispatcher.rs
+ create mode 100644 crates/gpui_android/src/display.rs
+ create mode 100644 crates/gpui_android/src/gpui_android.rs
+ create mode 100644 crates/gpui_android/src/ime.rs
+ create mode 100644 crates/gpui_android/src/input.rs
+ create mode 100644 crates/gpui_android/src/logging.rs
+ create mode 100644 crates/gpui_android/src/platform.rs
+ create mode 100644 crates/gpui_android/src/window.rs
+
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index dbb57f4..4a8c730 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -35,7 +35,12 @@ mod platform;
+ pub mod prelude;
+ /// Profiling utilities for task timing and thread performance tracking.
+ pub mod profiler;
+-#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
++#[cfg(any(
++    target_os = "windows",
++    target_os = "linux",
++    target_os = "android",
++    target_family = "wasm"
++))]
+ #[expect(missing_docs)]
+ pub mod queue;
+ mod scene;
+@@ -102,7 +107,12 @@ pub use keymap::*;
+ pub use path_builder::*;
+ pub use platform::*;
+ pub use profiler::*;
+-#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
++#[cfg(any(
++    target_os = "windows",
++    target_os = "linux",
++    target_os = "android",
++    target_family = "wasm"
++))]
+ pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
+ pub use refineable::*;
+ pub use scene::*;
+diff --git a/crates/gpui_android/Cargo.toml b/crates/gpui_android/Cargo.toml
+new file mode 100644
+index 0000000..1bcfcf2
+--- /dev/null
++++ b/crates/gpui_android/Cargo.toml
+@@ -0,0 +1,34 @@
++[package]
++name = "gpui_android"
++version = "0.1.0"
++edition.workspace = true
++publish.workspace = true
++license = "Apache-2.0"
++
++[lints]
++workspace = true
++
++[lib]
++path = "src/gpui_android.rs"
++
++[[example]]
++name = "android_input"
++path = "examples/android_input.rs"
++crate-type = ["cdylib"]
++
++[target.'cfg(target_os = "android")'.dependencies]
++android-activity.workspace = true
++android_logger.workspace = true
++anyhow.workspace = true
++futures.workspace = true
++gpui.workspace = true
++gpui_wgpu.workspace = true
++jni.workspace = true
++log.workspace = true
++ndk = { workspace = true, features = ["nativewindow", "rwh_06"] }
++raw-window-handle = "0.6"
++uuid.workspace = true
++
++[target.'cfg(target_os = "android")'.dev-dependencies]
++gpui_platform.workspace = true
++unicode-segmentation.workspace = true
+diff --git a/crates/gpui_android/LICENSE-APACHE b/crates/gpui_android/LICENSE-APACHE
+new file mode 120000
+index 0000000..1cd601d
+--- /dev/null
++++ b/crates/gpui_android/LICENSE-APACHE
+@@ -0,0 +1 @@
++../../LICENSE-APACHE
+\ No newline at end of file
+diff --git a/crates/gpui_android/examples/android_input.rs b/crates/gpui_android/examples/android_input.rs
+new file mode 100644
+index 0000000..63ab4cc
+--- /dev/null
++++ b/crates/gpui_android/examples/android_input.rs
+@@ -0,0 +1,776 @@
++// The upstream gpui `input` example (crates/gpui/examples/input.rs) with Linux-style key bindings
++// and an `android_main` entry point, for the gpui_android backend.
++
++#![cfg(target_os = "android")]
++
++use std::ops::Range;
++
++use gpui::{
++    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
++    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, Keystroke, LayoutId,
++    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
++    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WindowBounds,
++    WindowOptions, actions, black, div, fill, hsla, opaque_grey, point, prelude::*, px, relative,
++    rgb, rgba, size, white, yellow,
++};
++use gpui_android::AndroidApp;
++use gpui_platform::application;
++use unicode_segmentation::*;
++
++actions!(
++    text_input,
++    [
++        Backspace,
++        Delete,
++        Left,
++        Right,
++        SelectLeft,
++        SelectRight,
++        SelectAll,
++        Home,
++        End,
++        ShowCharacterPalette,
++        Paste,
++        Cut,
++        Copy,
++        Quit,
++    ]
++);
++
++struct TextInput {
++    focus_handle: FocusHandle,
++    content: SharedString,
++    placeholder: SharedString,
++    selected_range: Range<usize>,
++    selection_reversed: bool,
++    marked_range: Option<Range<usize>>,
++    last_layout: Option<ShapedLine>,
++    last_bounds: Option<Bounds<Pixels>>,
++    is_selecting: bool,
++}
++
++impl TextInput {
++    fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
++        if self.selected_range.is_empty() {
++            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
++        } else {
++            self.move_to(self.selected_range.start, cx)
++        }
++    }
++
++    fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
++        if self.selected_range.is_empty() {
++            self.move_to(self.next_boundary(self.selected_range.end), cx);
++        } else {
++            self.move_to(self.selected_range.end, cx)
++        }
++    }
++
++    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
++        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
++    }
++
++    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
++        self.select_to(self.next_boundary(self.cursor_offset()), cx);
++    }
++
++    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
++        self.move_to(0, cx);
++        self.select_to(self.content.len(), cx)
++    }
++
++    fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
++        self.move_to(0, cx);
++    }
++
++    fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
++        self.move_to(self.content.len(), cx);
++    }
++
++    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
++        if self.selected_range.is_empty() {
++            let prev = self.previous_boundary(self.cursor_offset());
++            if self.cursor_offset() == prev {
++                window.play_system_bell();
++                return;
++            }
++            self.select_to(prev, cx)
++        }
++        self.replace_text_in_range(None, "", window, cx)
++    }
++
++    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
++        if self.selected_range.is_empty() {
++            let next = self.next_boundary(self.cursor_offset());
++            if self.cursor_offset() == next {
++                window.play_system_bell();
++                return;
++            }
++            self.select_to(next, cx)
++        }
++        self.replace_text_in_range(None, "", window, cx)
++    }
++
++    fn on_mouse_down(
++        &mut self,
++        event: &MouseDownEvent,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.is_selecting = true;
++
++        if event.modifiers.shift {
++            self.select_to(self.index_for_mouse_position(event.position), cx);
++        } else {
++            self.move_to(self.index_for_mouse_position(event.position), cx)
++        }
++    }
++
++    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
++        self.is_selecting = false;
++    }
++
++    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
++        if self.is_selecting {
++            self.select_to(self.index_for_mouse_position(event.position), cx);
++        }
++    }
++
++    fn show_character_palette(
++        &mut self,
++        _: &ShowCharacterPalette,
++        window: &mut Window,
++        _: &mut Context<Self>,
++    ) {
++        window.show_character_palette();
++    }
++
++    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
++        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
++            self.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
++        }
++    }
++
++    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
++        if !self.selected_range.is_empty() {
++            cx.write_to_clipboard(ClipboardItem::new_string(
++                self.content[self.selected_range.clone()].to_string(),
++            ));
++        }
++    }
++    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
++        if !self.selected_range.is_empty() {
++            cx.write_to_clipboard(ClipboardItem::new_string(
++                self.content[self.selected_range.clone()].to_string(),
++            ));
++            self.replace_text_in_range(None, "", window, cx)
++        }
++    }
++
++    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
++        self.selected_range = offset..offset;
++        cx.notify()
++    }
++
++    fn cursor_offset(&self) -> usize {
++        if self.selection_reversed {
++            self.selected_range.start
++        } else {
++            self.selected_range.end
++        }
++    }
++
++    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
++        if self.content.is_empty() {
++            return 0;
++        }
++
++        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
++        else {
++            return 0;
++        };
++        if position.y < bounds.top() {
++            return 0;
++        }
++        if position.y > bounds.bottom() {
++            return self.content.len();
++        }
++        line.closest_index_for_x(position.x - bounds.left())
++    }
++
++    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
++        if self.selection_reversed {
++            self.selected_range.start = offset
++        } else {
++            self.selected_range.end = offset
++        };
++        if self.selected_range.end < self.selected_range.start {
++            self.selection_reversed = !self.selection_reversed;
++            self.selected_range = self.selected_range.end..self.selected_range.start;
++        }
++        cx.notify()
++    }
++
++    fn offset_from_utf16(&self, offset: usize) -> usize {
++        let mut utf8_offset = 0;
++        let mut utf16_count = 0;
++
++        for ch in self.content.chars() {
++            if utf16_count >= offset {
++                break;
++            }
++            utf16_count += ch.len_utf16();
++            utf8_offset += ch.len_utf8();
++        }
++
++        utf8_offset
++    }
++
++    fn offset_to_utf16(&self, offset: usize) -> usize {
++        let mut utf16_offset = 0;
++        let mut utf8_count = 0;
++
++        for ch in self.content.chars() {
++            if utf8_count >= offset {
++                break;
++            }
++            utf8_count += ch.len_utf8();
++            utf16_offset += ch.len_utf16();
++        }
++
++        utf16_offset
++    }
++
++    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
++        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
++    }
++
++    fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
++        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
++    }
++
++    fn previous_boundary(&self, offset: usize) -> usize {
++        self.content
++            .grapheme_indices(true)
++            .rev()
++            .find_map(|(idx, _)| (idx < offset).then_some(idx))
++            .unwrap_or(0)
++    }
++
++    fn next_boundary(&self, offset: usize) -> usize {
++        self.content
++            .grapheme_indices(true)
++            .find_map(|(idx, _)| (idx > offset).then_some(idx))
++            .unwrap_or(self.content.len())
++    }
++
++    fn reset(&mut self) {
++        self.content = "".into();
++        self.selected_range = 0..0;
++        self.selection_reversed = false;
++        self.marked_range = None;
++        self.last_layout = None;
++        self.last_bounds = None;
++        self.is_selecting = false;
++    }
++}
++
++impl EntityInputHandler for TextInput {
++    fn text_for_range(
++        &mut self,
++        range_utf16: Range<usize>,
++        actual_range: &mut Option<Range<usize>>,
++        _window: &mut Window,
++        _cx: &mut Context<Self>,
++    ) -> Option<String> {
++        let range = self.range_from_utf16(&range_utf16);
++        actual_range.replace(self.range_to_utf16(&range));
++        Some(self.content[range].to_string())
++    }
++
++    fn selected_text_range(
++        &mut self,
++        _ignore_disabled_input: bool,
++        _window: &mut Window,
++        _cx: &mut Context<Self>,
++    ) -> Option<UTF16Selection> {
++        Some(UTF16Selection {
++            range: self.range_to_utf16(&self.selected_range),
++            reversed: self.selection_reversed,
++        })
++    }
++
++    fn marked_text_range(
++        &self,
++        _window: &mut Window,
++        _cx: &mut Context<Self>,
++    ) -> Option<Range<usize>> {
++        self.marked_range
++            .as_ref()
++            .map(|range| self.range_to_utf16(range))
++    }
++
++    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
++        self.marked_range = None;
++    }
++
++    fn replace_text_in_range(
++        &mut self,
++        range_utf16: Option<Range<usize>>,
++        new_text: &str,
++        _: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let range = range_utf16
++            .as_ref()
++            .map(|range_utf16| self.range_from_utf16(range_utf16))
++            .or(self.marked_range.clone())
++            .unwrap_or(self.selected_range.clone());
++
++        self.content =
++            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
++                .into();
++        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
++        self.marked_range.take();
++        cx.notify();
++    }
++
++    fn replace_and_mark_text_in_range(
++        &mut self,
++        range_utf16: Option<Range<usize>>,
++        new_text: &str,
++        new_selected_range_utf16: Option<Range<usize>>,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let range = range_utf16
++            .as_ref()
++            .map(|range_utf16| self.range_from_utf16(range_utf16))
++            .or(self.marked_range.clone())
++            .unwrap_or(self.selected_range.clone());
++
++        self.content =
++            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
++                .into();
++        if !new_text.is_empty() {
++            self.marked_range = Some(range.start..range.start + new_text.len());
++        } else {
++            self.marked_range = None;
++        }
++        self.selected_range = new_selected_range_utf16
++            .as_ref()
++            .map(|range_utf16| self.range_from_utf16(range_utf16))
++            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
++            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
++
++        cx.notify();
++    }
++
++    fn bounds_for_range(
++        &mut self,
++        range_utf16: Range<usize>,
++        bounds: Bounds<Pixels>,
++        _window: &mut Window,
++        _cx: &mut Context<Self>,
++    ) -> Option<Bounds<Pixels>> {
++        let last_layout = self.last_layout.as_ref()?;
++        let range = self.range_from_utf16(&range_utf16);
++        Some(Bounds::from_corners(
++            point(
++                bounds.left() + last_layout.x_for_index(range.start),
++                bounds.top(),
++            ),
++            point(
++                bounds.left() + last_layout.x_for_index(range.end),
++                bounds.bottom(),
++            ),
++        ))
++    }
++
++    fn character_index_for_point(
++        &mut self,
++        point: gpui::Point<Pixels>,
++        _window: &mut Window,
++        _cx: &mut Context<Self>,
++    ) -> Option<usize> {
++        let line_point = self.last_bounds?.localize(&point)?;
++        let last_layout = self.last_layout.as_ref()?;
++
++        assert_eq!(last_layout.text, self.content);
++        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
++        Some(self.offset_to_utf16(utf8_index))
++    }
++}
++
++struct TextElement {
++    input: Entity<TextInput>,
++}
++
++struct PrepaintState {
++    line: Option<ShapedLine>,
++    cursor: Option<PaintQuad>,
++    selection: Option<PaintQuad>,
++}
++
++impl IntoElement for TextElement {
++    type Element = Self;
++
++    fn into_element(self) -> Self::Element {
++        self
++    }
++}
++
++impl Element for TextElement {
++    type RequestLayoutState = ();
++    type PrepaintState = PrepaintState;
++
++    fn id(&self) -> Option<ElementId> {
++        None
++    }
++
++    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
++        None
++    }
++
++    fn request_layout(
++        &mut self,
++        _id: Option<&GlobalElementId>,
++        _inspector_id: Option<&gpui::InspectorElementId>,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> (LayoutId, Self::RequestLayoutState) {
++        let mut style = Style::default();
++        style.size.width = relative(1.).into();
++        style.size.height = window.line_height().into();
++        (window.request_layout(style, [], cx), ())
++    }
++
++    fn prepaint(
++        &mut self,
++        _id: Option<&GlobalElementId>,
++        _inspector_id: Option<&gpui::InspectorElementId>,
++        bounds: Bounds<Pixels>,
++        _request_layout: &mut Self::RequestLayoutState,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> Self::PrepaintState {
++        let input = self.input.read(cx);
++        let content = input.content.clone();
++        let selected_range = input.selected_range.clone();
++        let cursor = input.cursor_offset();
++        let style = window.text_style();
++
++        let (display_text, text_color) = if content.is_empty() {
++            (input.placeholder.clone(), hsla(0., 0., 0., 0.2))
++        } else {
++            (content, style.color)
++        };
++
++        let run = TextRun {
++            len: display_text.len(),
++            font: style.font(),
++            color: text_color,
++            background_color: None,
++            underline: None,
++            strikethrough: None,
++        };
++        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
++            vec![
++                TextRun {
++                    len: marked_range.start,
++                    ..run.clone()
++                },
++                TextRun {
++                    len: marked_range.end - marked_range.start,
++                    underline: Some(UnderlineStyle {
++                        color: Some(run.color),
++                        thickness: px(1.0),
++                        wavy: false,
++                    }),
++                    ..run.clone()
++                },
++                TextRun {
++                    len: display_text.len() - marked_range.end,
++                    ..run
++                },
++            ]
++            .into_iter()
++            .filter(|run| run.len > 0)
++            .collect()
++        } else {
++            vec![run]
++        };
++
++        let font_size = style.font_size.to_pixels(window.rem_size());
++        let line = window
++            .text_system()
++            .shape_line(display_text, font_size, &runs, None);
++
++        let cursor_pos = line.x_for_index(cursor);
++        let (selection, cursor) = if selected_range.is_empty() {
++            (
++                None,
++                Some(fill(
++                    Bounds::new(
++                        point(bounds.left() + cursor_pos, bounds.top()),
++                        size(px(2.), bounds.bottom() - bounds.top()),
++                    ),
++                    gpui::blue(),
++                )),
++            )
++        } else {
++            (
++                Some(fill(
++                    Bounds::from_corners(
++                        point(
++                            bounds.left() + line.x_for_index(selected_range.start),
++                            bounds.top(),
++                        ),
++                        point(
++                            bounds.left() + line.x_for_index(selected_range.end),
++                            bounds.bottom(),
++                        ),
++                    ),
++                    rgba(0x3311ff30),
++                )),
++                None,
++            )
++        };
++        PrepaintState {
++            line: Some(line),
++            cursor,
++            selection,
++        }
++    }
++
++    fn paint(
++        &mut self,
++        _id: Option<&GlobalElementId>,
++        _inspector_id: Option<&gpui::InspectorElementId>,
++        bounds: Bounds<Pixels>,
++        _request_layout: &mut Self::RequestLayoutState,
++        prepaint: &mut Self::PrepaintState,
++        window: &mut Window,
++        cx: &mut App,
++    ) {
++        let focus_handle = self.input.read(cx).focus_handle.clone();
++        window.handle_input(
++            &focus_handle,
++            ElementInputHandler::new(bounds, self.input.clone()),
++            cx,
++        );
++        if let Some(selection) = prepaint.selection.take() {
++            window.paint_quad(selection)
++        }
++        let line = prepaint.line.take().unwrap();
++        line.paint(
++            bounds.origin,
++            window.line_height(),
++            gpui::TextAlign::Left,
++            None,
++            window,
++            cx,
++        )
++        .unwrap();
++
++        if focus_handle.is_focused(window)
++            && let Some(cursor) = prepaint.cursor.take()
++        {
++            window.paint_quad(cursor);
++        }
++
++        self.input.update(cx, |input, _cx| {
++            input.last_layout = Some(line);
++            input.last_bounds = Some(bounds);
++        });
++    }
++}
++
++impl Render for TextInput {
++    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        div()
++            .flex()
++            .key_context("TextInput")
++            .track_focus(&self.focus_handle(cx))
++            .cursor(CursorStyle::IBeam)
++            .on_action(cx.listener(Self::backspace))
++            .on_action(cx.listener(Self::delete))
++            .on_action(cx.listener(Self::left))
++            .on_action(cx.listener(Self::right))
++            .on_action(cx.listener(Self::select_left))
++            .on_action(cx.listener(Self::select_right))
++            .on_action(cx.listener(Self::select_all))
++            .on_action(cx.listener(Self::home))
++            .on_action(cx.listener(Self::end))
++            .on_action(cx.listener(Self::show_character_palette))
++            .on_action(cx.listener(Self::paste))
++            .on_action(cx.listener(Self::cut))
++            .on_action(cx.listener(Self::copy))
++            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
++            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
++            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
++            .on_mouse_move(cx.listener(Self::on_mouse_move))
++            .bg(rgb(0xeeeeee))
++            .line_height(px(30.))
++            .text_size(px(24.))
++            .child(
++                div()
++                    .h(px(30. + 4. * 2.))
++                    .w_full()
++                    .p(px(4.))
++                    .bg(white())
++                    .child(TextElement { input: cx.entity() }),
++            )
++    }
++}
++
++impl Focusable for TextInput {
++    fn focus_handle(&self, _: &App) -> FocusHandle {
++        self.focus_handle.clone()
++    }
++}
++
++struct InputExample {
++    text_input: Entity<TextInput>,
++    recent_keystrokes: Vec<Keystroke>,
++    focus_handle: FocusHandle,
++}
++
++impl Focusable for InputExample {
++    fn focus_handle(&self, _: &App) -> FocusHandle {
++        self.focus_handle.clone()
++    }
++}
++
++impl InputExample {
++    fn on_reset_click(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
++        self.recent_keystrokes.clear();
++        self.text_input
++            .update(cx, |text_input, _cx| text_input.reset());
++        cx.notify();
++    }
++}
++
++impl Render for InputExample {
++    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        div()
++            .bg(rgb(0xaaaaaa))
++            .track_focus(&self.focus_handle(cx))
++            .flex()
++            .flex_col()
++            .size_full()
++            .child(
++                div()
++                    .bg(white())
++                    .border_b_1()
++                    .border_color(black())
++                    .flex()
++                    .flex_row()
++                    .justify_between()
++                    .child(format!("Keyboard {}", cx.keyboard_layout().name()))
++                    .child(
++                        div()
++                            .border_1()
++                            .border_color(black())
++                            .px_2()
++                            .bg(yellow())
++                            .child("Reset")
++                            .hover(|style| {
++                                style
++                                    .bg(yellow().blend(opaque_grey(0.5, 0.5)))
++                                    .cursor_pointer()
++                            })
++                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_reset_click)),
++                    ),
++            )
++            .child(self.text_input.clone())
++            .children(self.recent_keystrokes.iter().rev().map(|ks| {
++                format!(
++                    "{:} {}",
++                    ks.unparse(),
++                    if let Some(key_char) = ks.key_char.as_ref() {
++                        format!("-> {:?}", key_char)
++                    } else {
++                        "".to_owned()
++                    }
++                )
++            }))
++    }
++}
++
++fn run_example() {
++    application().run(|cx: &mut App| {
++        let bounds = Bounds::centered(None, size(px(300.0), px(300.0)), cx);
++        cx.bind_keys([
++            KeyBinding::new("backspace", Backspace, None),
++            KeyBinding::new("delete", Delete, None),
++            KeyBinding::new("left", Left, None),
++            KeyBinding::new("right", Right, None),
++            KeyBinding::new("shift-left", SelectLeft, None),
++            KeyBinding::new("shift-right", SelectRight, None),
++            KeyBinding::new("ctrl-a", SelectAll, None),
++            KeyBinding::new("ctrl-v", Paste, None),
++            KeyBinding::new("ctrl-c", Copy, None),
++            KeyBinding::new("ctrl-x", Cut, None),
++            KeyBinding::new("home", Home, None),
++            KeyBinding::new("end", End, None),
++            KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
++        ]);
++
++        let window = cx
++            .open_window(
++                WindowOptions {
++                    window_bounds: Some(WindowBounds::Windowed(bounds)),
++                    ..Default::default()
++                },
++                |_, cx| {
++                    let text_input = cx.new(|cx| TextInput {
++                        focus_handle: cx.focus_handle(),
++                        content: "".into(),
++                        placeholder: "Type here...".into(),
++                        selected_range: 0..0,
++                        selection_reversed: false,
++                        marked_range: None,
++                        last_layout: None,
++                        last_bounds: None,
++                        is_selecting: false,
++                    });
++                    cx.new(|cx| InputExample {
++                        text_input,
++                        recent_keystrokes: vec![],
++                        focus_handle: cx.focus_handle(),
++                    })
++                },
++            )
++            .unwrap();
++        let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
++        cx.observe_keystrokes(move |ev, _, cx| {
++            view.update(cx, |view, cx| {
++                view.recent_keystrokes.push(ev.keystroke.clone());
++                cx.notify();
++            })
++        })
++        .detach();
++        cx.on_keyboard_layout_change({
++            move |cx| {
++                window.update(cx, |_, _, cx| cx.notify()).ok();
++            }
++        })
++        .detach();
++
++        window
++            .update(cx, |view, window, cx| {
++                window.focus(&view.text_input.focus_handle(cx), cx);
++                cx.activate(true);
++            })
++            .unwrap();
++        cx.on_action(|_: &Quit, cx| cx.quit());
++        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
++    });
++}
++
++#[unsafe(no_mangle)]
++fn android_main(app: AndroidApp) {
++    gpui_android::init(app);
++    run_example();
++}
+diff --git a/crates/gpui_android/src/dispatcher.rs b/crates/gpui_android/src/dispatcher.rs
+new file mode 100644
+index 0000000..9c6c7d9
+--- /dev/null
++++ b/crates/gpui_android/src/dispatcher.rs
+@@ -0,0 +1,193 @@
++use std::{
++    cmp::Ordering,
++    collections::BinaryHeap,
++    sync::{Arc, Condvar, Mutex},
++    thread,
++    time::{Duration, Instant},
++};
++
++use android_activity::AndroidAppWaker;
++use gpui::{
++    GLOBAL_THREAD_TIMINGS, PlatformDispatcher, Priority, PriorityQueueReceiver,
++    PriorityQueueSender, RunnableVariant, TaskTiming, ThreadTaskTimings, profiler,
++};
++
++const MIN_THREADS: usize = 2;
++
++pub(crate) struct AndroidDispatcher {
++    main_sender: PriorityQueueSender<RunnableVariant>,
++    waker: AndroidAppWaker,
++    timers: Arc<TimerQueue>,
++    background_sender: PriorityQueueSender<RunnableVariant>,
++    _threads: Vec<thread::JoinHandle<()>>,
++    main_thread_id: thread::ThreadId,
++}
++
++impl AndroidDispatcher {
++    pub(crate) fn new(
++        main_sender: PriorityQueueSender<RunnableVariant>,
++        waker: AndroidAppWaker,
++    ) -> Self {
++        let (background_sender, background_receiver) = PriorityQueueReceiver::new();
++        let thread_count =
++            thread::available_parallelism().map_or(MIN_THREADS, |n| n.get().max(MIN_THREADS));
++
++        let mut threads = (0..thread_count)
++            .map(|i| {
++                let receiver: PriorityQueueReceiver<RunnableVariant> = background_receiver.clone();
++                thread::Builder::new()
++                    .name(format!("Worker-{i}"))
++                    .spawn(move || {
++                        for runnable in receiver.iter() {
++                            run_timed(runnable);
++                        }
++                    })
++                    .expect("failed to spawn a worker thread")
++            })
++            .collect::<Vec<_>>();
++
++        let timers = Arc::new(TimerQueue::default());
++        threads.push({
++            let timers = timers.clone();
++            thread::Builder::new()
++                .name("Timer".to_owned())
++                .spawn(move || timers.run())
++                .expect("failed to spawn the timer thread")
++        });
++
++        Self {
++            main_sender,
++            waker,
++            timers,
++            background_sender,
++            _threads: threads,
++            main_thread_id: thread::current().id(),
++        }
++    }
++}
++
++fn run_timed(runnable: RunnableVariant) {
++    let mut timing = TaskTiming {
++        location: runnable.metadata().location,
++        start: Instant::now(),
++        end: None,
++    };
++    profiler::add_task_timing(timing);
++    runnable.run();
++    timing.end = Some(Instant::now());
++    profiler::add_task_timing(timing);
++}
++
++impl PlatformDispatcher for AndroidDispatcher {
++    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
++        let global_timings = GLOBAL_THREAD_TIMINGS.lock();
++        ThreadTaskTimings::convert(&global_timings)
++    }
++
++    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
++        profiler::get_current_thread_task_timings()
++    }
++
++    fn is_main_thread(&self) -> bool {
++        thread::current().id() == self.main_thread_id
++    }
++
++    fn dispatch(&self, runnable: RunnableVariant, priority: Priority) {
++        self.background_sender
++            .send(priority, runnable)
++            .unwrap_or_else(|_| panic!("blocking sender returned without value"));
++    }
++
++    fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
++        match self.main_sender.send(priority, runnable) {
++            Ok(()) => self.waker.wake(),
++            // The receiver is gone, so the app is shutting down and this is a background thread:
++            // the runnable may hold a !Send future, which must not be dropped here.
++            Err(runnable) => std::mem::forget(runnable),
++        }
++    }
++
++    fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
++        self.timers.push(Instant::now() + duration, runnable);
++    }
++
++    fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
++        thread::spawn(f);
++    }
++}
++
++struct Timer {
++    deadline: Instant,
++    sequence: u64,
++    runnable: RunnableVariant,
++}
++
++impl PartialEq for Timer {
++    fn eq(&self, other: &Self) -> bool {
++        self.deadline == other.deadline && self.sequence == other.sequence
++    }
++}
++
++impl Eq for Timer {}
++
++impl PartialOrd for Timer {
++    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++        Some(self.cmp(other))
++    }
++}
++
++impl Ord for Timer {
++    fn cmp(&self, other: &Self) -> Ordering {
++        other
++            .deadline
++            .cmp(&self.deadline)
++            .then_with(|| other.sequence.cmp(&self.sequence))
++    }
++}
++
++#[derive(Default)]
++struct TimerQueue {
++    state: Mutex<TimerState>,
++    condvar: Condvar,
++}
++
++#[derive(Default)]
++struct TimerState {
++    heap: BinaryHeap<Timer>,
++    next_sequence: u64,
++}
++
++impl TimerQueue {
++    fn push(&self, deadline: Instant, runnable: RunnableVariant) {
++        let mut state = self.state.lock().unwrap();
++        let sequence = state.next_sequence;
++        state.next_sequence += 1;
++        state.heap.push(Timer {
++            deadline,
++            sequence,
++            runnable,
++        });
++        self.condvar.notify_one();
++    }
++
++    fn run(&self) {
++        let mut state = self.state.lock().unwrap();
++        loop {
++            let now = Instant::now();
++            match state.heap.peek().map(|timer| timer.deadline) {
++                Some(deadline) if deadline <= now => {
++                    let timer = state.heap.pop().expect("peeked timer");
++                    drop(state);
++                    run_timed(timer.runnable);
++                    state = self.state.lock().unwrap();
++                }
++                Some(deadline) => {
++                    state = self.condvar.wait_timeout(state, deadline - now).unwrap().0;
++                }
++                None => {
++                    state = self.condvar.wait(state).unwrap();
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/gpui_android/src/display.rs b/crates/gpui_android/src/display.rs
+new file mode 100644
+index 0000000..57b4177
+--- /dev/null
++++ b/crates/gpui_android/src/display.rs
+@@ -0,0 +1,41 @@
++use anyhow::Result;
++use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay};
++
++const BUILT_IN_DISPLAY: uuid::Uuid = uuid::Uuid::from_u128(1);
++
++#[derive(Debug)]
++pub struct AndroidDisplay {
++    bounds: Bounds<Pixels>,
++    visible_bounds: Bounds<Pixels>,
++}
++
++impl AndroidDisplay {
++    pub fn new(bounds: Bounds<Pixels>, visible_bounds: Bounds<Pixels>) -> Self {
++        Self {
++            bounds,
++            visible_bounds,
++        }
++    }
++}
++
++impl PlatformDisplay for AndroidDisplay {
++    fn id(&self) -> DisplayId {
++        DisplayId::new(0)
++    }
++
++    fn uuid(&self) -> Result<uuid::Uuid> {
++        Ok(BUILT_IN_DISPLAY)
++    }
++
++    fn bounds(&self) -> Bounds<Pixels> {
++        self.bounds
++    }
++
++    fn visible_bounds(&self) -> Bounds<Pixels> {
++        self.visible_bounds
++    }
++
++    fn default_bounds(&self) -> Bounds<Pixels> {
++        self.visible_bounds
++    }
++}
+diff --git a/crates/gpui_android/src/gpui_android.rs b/crates/gpui_android/src/gpui_android.rs
+new file mode 100644
+index 0000000..f90a9d7
+--- /dev/null
++++ b/crates/gpui_android/src/gpui_android.rs
+@@ -0,0 +1,42 @@
++#![cfg(target_os = "android")]
++
++mod dispatcher;
++mod display;
++mod ime;
++mod input;
++mod logging;
++mod platform;
++mod window;
++
++use std::sync::Mutex;
++
++pub use android_activity::AndroidApp;
++pub use display::AndroidDisplay;
++pub use logging::init_logging;
++pub use platform::AndroidPlatform;
++
++static ANDROID_APP: Mutex<Option<AndroidApp>> = Mutex::new(None);
++
++/// Records the app handed to `android_main`; call it before creating the GPUI application.
++pub fn init(app: AndroidApp) {
++    init_logging();
++    std::panic::set_hook(Box::new(|info| {
++        let (file, line) = info
++            .location()
++            .map_or(("?", 0), |location| (location.file(), location.line()));
++        log::error!("gpui_android: E_PANIC {file}:{line}");
++        // Abort here so neither Rust's abort message (debuggerd) nor android-activity's panic log sees the payload.
++        std::process::abort();
++    }));
++    *ANDROID_APP
++        .lock()
++        .unwrap_or_else(|error| error.into_inner()) = Some(app);
++}
++
++pub fn android_app() -> AndroidApp {
++    ANDROID_APP
++        .lock()
++        .unwrap_or_else(|error| error.into_inner())
++        .clone()
++        .expect("gpui_android::init must run before the platform is created")
++}
+diff --git a/crates/gpui_android/src/ime.rs b/crates/gpui_android/src/ime.rs
+new file mode 100644
+index 0000000..96ad1ce
+--- /dev/null
++++ b/crates/gpui_android/src/ime.rs
+@@ -0,0 +1,182 @@
++//! Bridge to ai.outgate.zed.ZedActivity: soft-keyboard text from its InputConnection and the system clipboard.
++//! Java calls the native methods on its UI thread; events are queued here and applied on the android_main thread.
++
++use std::sync::Mutex;
++
++use android_activity::AndroidAppWaker;
++use jni::{
++    EnvUnowned,
++    objects::{JClass, JString},
++};
++
++pub(crate) enum ImeEvent {
++    Commit(String),
++    Compose(String),
++    FinishComposing,
++    DeleteSurrounding {
++        before: usize,
++        after: usize,
++    },
++    Key {
++        key_code: i32,
++        meta_state: i32,
++        down: bool,
++    },
++    Insets {
++        bottom: i32,
++    },
++    Back,
++}
++
++static QUEUE: Mutex<Vec<ImeEvent>> = Mutex::new(Vec::new());
++static WAKER: Mutex<Option<AndroidAppWaker>> = Mutex::new(None);
++
++pub(crate) fn set_waker(waker: AndroidAppWaker) {
++    *WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
++}
++
++pub(crate) fn drain() -> Vec<ImeEvent> {
++    std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|e| e.into_inner()))
++}
++
++pub(crate) fn wake() {
++    if let Some(waker) = WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
++        waker.wake();
++    }
++}
++
++fn push(event: ImeEvent) {
++    QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(event);
++    if let Some(waker) = WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
++        waker.wake();
++    }
++}
++
++fn push_text(mut env: EnvUnowned<'_>, text: JString<'_>, make: fn(String) -> ImeEvent) {
++    let outcome = env.with_env(|env| -> jni::errors::Result<()> {
++        push(make(text.try_to_string(env)?));
++        Ok(())
++    });
++    outcome.resolve::<jni::errors::LogErrorAndDefault>();
++}
++
++#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeCommitText<'local>(
++    env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    text: JString<'local>,
++) {
++    push_text(env, text, ImeEvent::Commit);
++}
++
++#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeSetComposingText<'local>(
++    env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    text: JString<'local>,
++) {
++    push_text(env, text, ImeEvent::Compose);
++}
++
++#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeFinishComposing<'local>(
++    _env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++) {
++    push(ImeEvent::FinishComposing);
++}
++
++#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeDeleteSurrounding<'local>(
++    _env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    before: i32,
++    after: i32,
++) {
++    push(ImeEvent::DeleteSurrounding {
++        before: before.max(0) as usize,
++        after: after.max(0) as usize,
++    });
++}
++
++#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeKey<'local>(
++    _env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    key_code: i32,
++    meta_state: i32,
++    down: jni::sys::jboolean,
++) {
++    push(ImeEvent::Key {
++        key_code,
++        meta_state,
++        down,
++    });
++}
++
++#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeBack<'local>(
++    _env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++) {
++    push(ImeEvent::Back);
++}
++
++#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeInsets<'local>(
++    _env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    top: i32,
++    bottom: i32,
++) {
++    let _ = top;
++    push(ImeEvent::Insets { bottom });
++}
++
++jni::bind_java_type! {
++    ZedActivity => "ai.outgate.zed.ZedActivity",
++    methods {
++        fn show_keyboard(show: bool),
++        fn read_clipboard() -> JString,
++        fn write_clipboard(text: JString),
++    }
++}
++
++fn with_activity<T>(
++    f: impl FnOnce(&mut jni::Env, &ZedActivity) -> jni::errors::Result<T>,
++) -> Option<T> {
++    let app = crate::android_app();
++    // SAFETY: vm_as_ptr is the process JavaVM, valid for the process lifetime.
++    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) };
++    vm.attach_current_thread(|env| -> jni::errors::Result<T> {
++        let raw = app.activity_as_ptr() as jni::sys::jobject;
++        // SAFETY: an unowned global reference that stays valid while `app` is alive; the cast takes no ownership.
++        // The cast fails (and nothing is called) when the activity is a plain NativeActivity.
++        let activity = unsafe { env.as_cast_raw::<jni::refs::Global<ZedActivity>>(&raw)? };
++        f(env, &activity)
++    })
++    .ok()
++}
++
++pub(crate) fn show_keyboard(show: bool) {
++    with_activity(|env, activity| activity.show_keyboard(env, show));
++}
++
++pub(crate) fn read_clipboard() -> Option<String> {
++    with_activity(|env, activity| {
++        let text = activity.read_clipboard(env)?;
++        if text.is_null() {
++            return Ok(None);
++        }
++        text.try_to_string(env).map(Some)
++    })
++    .flatten()
++}
++
++pub(crate) fn write_clipboard(text: &str) -> bool {
++    with_activity(|env, activity| {
++        let text = JString::from_str(env, text)?;
++        activity.write_clipboard(env, &text)
++    })
++    .is_some()
++}
+diff --git a/crates/gpui_android/src/input.rs b/crates/gpui_android/src/input.rs
+new file mode 100644
+index 0000000..597181f
+--- /dev/null
++++ b/crates/gpui_android/src/input.rs
+@@ -0,0 +1,496 @@
++use std::{
++    collections::{HashMap, hash_map::Entry},
++    time::{Duration, Instant},
++};
++
++use android_activity::{
++    AndroidApp,
++    input::{
++        Axis, Button, KeyAction, KeyCharacterMap, KeyEvent, KeyMapChar, Keycode, MetaState,
++        MotionAction, MotionEvent, ToolType,
++    },
++};
++use gpui::{
++    Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
++    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta,
++    ScrollWheelEvent, TouchPhase, point, px,
++};
++
++const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
++const DOUBLE_CLICK_DISTANCE: f32 = 24.;
++const TOUCH_SLOP: f32 = 8.;
++const TOUCH_HOLD: Duration = Duration::from_millis(80);
++const META_CTRL_MASK: u32 = 0x1000 | 0x2000 | 0x4000;
++
++#[derive(Default)]
++pub(crate) struct InputState {
++    pressed: Option<MouseButton>,
++    scroll_anchor: Option<Point<Pixels>>,
++    scrolling: bool,
++    pending_down: Option<(Point<Pixels>, Instant)>,
++    last_click: Option<(Instant, Point<Pixels>, usize)>,
++    key_maps: HashMap<i32, KeyCharacterMap>,
++}
++
++pub(crate) struct Translated {
++    pub(crate) events: Vec<PlatformInput>,
++    pub(crate) modifiers: Option<(Modifiers, Capslock)>,
++}
++
++fn modifiers_of(meta: MetaState) -> Modifiers {
++    Modifiers {
++        control: meta.ctrl_on(),
++        alt: meta.alt_on(),
++        shift: meta.shift_on(),
++        platform: meta.meta_on(),
++        function: meta.function_on(),
++    }
++}
++
++fn capslock_of(meta: MetaState) -> Capslock {
++    Capslock {
++        on: meta.caps_lock_on(),
++    }
++}
++
++impl InputState {
++    fn click_count(&mut self, position: Point<Pixels>) -> usize {
++        let now = Instant::now();
++        let count = match self.last_click {
++            Some((at, last, count))
++                if now.duration_since(at) <= DOUBLE_CLICK_INTERVAL
++                    && (position.x - last.x).abs() <= px(DOUBLE_CLICK_DISTANCE)
++                    && (position.y - last.y).abs() <= px(DOUBLE_CLICK_DISTANCE) =>
++            {
++                count + 1
++            }
++            _ => 1,
++        };
++        self.last_click = Some((now, position, count));
++        count
++    }
++
++    fn click_count_for_release(&self) -> usize {
++        self.last_click.map_or(1, |(_, _, count)| count)
++    }
++
++    pub(crate) fn motion(
++        &mut self,
++        event: &MotionEvent<'_>,
++        scale_factor: f32,
++        modifiers: Modifiers,
++    ) -> Vec<PlatformInput> {
++        let to_logical =
++            |x: f32, y: f32| -> Point<Pixels> { point(px(x / scale_factor), px(y / scale_factor)) };
++        let index = event.pointer_index();
++        let pointer = event.pointer_at_index(index.min(event.pointer_count().saturating_sub(1)));
++        let position = to_logical(pointer.x(), pointer.y());
++        let mut events = Vec::new();
++
++        if pointer.tool_type() == ToolType::Mouse {
++            match event.action() {
++                MotionAction::ButtonPress => {
++                    let button = mouse_button(event.action_button());
++                    self.pressed = Some(button);
++                    events.push(PlatformInput::MouseDown(MouseDownEvent {
++                        button,
++                        position,
++                        modifiers,
++                        click_count: self.click_count(position),
++                        first_mouse: false,
++                    }));
++                }
++                MotionAction::ButtonRelease => {
++                    let button = mouse_button(event.action_button());
++                    self.pressed = held_button(event.button_state().0);
++                    events.push(PlatformInput::MouseUp(MouseUpEvent {
++                        button,
++                        position,
++                        modifiers,
++                        click_count: self.click_count_for_release(),
++                    }));
++                }
++                MotionAction::Move | MotionAction::HoverMove => {
++                    events.push(PlatformInput::MouseMove(MouseMoveEvent {
++                        position,
++                        pressed_button: self.pressed,
++                        modifiers,
++                    }));
++                }
++                MotionAction::Scroll => {
++                    let delta = point(
++                        -pointer.axis_value(Axis::Hscroll),
++                        pointer.axis_value(Axis::Vscroll),
++                    );
++                    events.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
++                        position,
++                        delta: ScrollDelta::Lines(delta),
++                        modifiers,
++                        touch_phase: TouchPhase::Moved,
++                    }));
++                }
++                _ => {}
++            }
++            return events;
++        }
++
++        let centroid = |skip: Option<usize>| {
++            let (x, y, count) = event
++                .pointers()
++                .filter(|p| Some(p.pointer_index()) != skip)
++                .fold((0., 0., 0.), |(x, y, n), p| (x + p.x(), y + p.y(), n + 1.));
++            let count: f32 = if count > 0. { count } else { 1. };
++            to_logical(x / count, y / count)
++        };
++        let scroll = |position, delta, touch_phase| {
++            PlatformInput::ScrollWheel(ScrollWheelEvent {
++                position,
++                delta: ScrollDelta::Pixels(delta),
++                modifiers,
++                touch_phase,
++            })
++        };
++
++        match event.action() {
++            MotionAction::Down => {
++                self.scroll_anchor = None;
++                self.scrolling = false;
++                self.pressed = None;
++                self.pending_down = Some((position, Instant::now()));
++            }
++            MotionAction::PointerDown => {
++                self.pending_down = None;
++                if self.pressed.take().is_some() {
++                    let first = event.pointer_at_index(0);
++                    events.push(PlatformInput::MouseUp(MouseUpEvent {
++                        button: MouseButton::Left,
++                        position: to_logical(first.x(), first.y()),
++                        modifiers,
++                        click_count: self.click_count_for_release(),
++                    }));
++                }
++                let anchor = centroid(None);
++                self.scroll_anchor = Some(anchor);
++                if !self.scrolling {
++                    self.scrolling = true;
++                    events.push(scroll(anchor, Point::default(), TouchPhase::Started));
++                }
++            }
++            MotionAction::Move => {
++                if let Some(anchor) = self.scroll_anchor {
++                    if self.scrolling && event.pointer_count() >= 2 {
++                        let current = centroid(None);
++                        self.scroll_anchor = Some(current);
++                        events.push(scroll(current, current - anchor, TouchPhase::Moved));
++                    }
++                } else if let Some((down_at, since)) = self.pending_down {
++                    let moved = (position.x - down_at.x).abs() > px(TOUCH_SLOP)
++                        || (position.y - down_at.y).abs() > px(TOUCH_SLOP);
++                    if moved || since.elapsed() >= TOUCH_HOLD {
++                        self.pending_down = None;
++                        self.pressed = Some(MouseButton::Left);
++                        events.push(PlatformInput::MouseDown(MouseDownEvent {
++                            button: MouseButton::Left,
++                            position: down_at,
++                            modifiers,
++                            click_count: self.click_count(down_at),
++                            first_mouse: false,
++                        }));
++                        events.push(PlatformInput::MouseMove(MouseMoveEvent {
++                            position,
++                            pressed_button: self.pressed,
++                            modifiers,
++                        }));
++                    }
++                } else if self.pressed.is_some() {
++                    events.push(PlatformInput::MouseMove(MouseMoveEvent {
++                        position,
++                        pressed_button: self.pressed,
++                        modifiers,
++                    }));
++                }
++            }
++            MotionAction::PointerUp => {
++                if self.scroll_anchor.is_some() {
++                    let remaining = centroid(Some(event.pointer_index()));
++                    self.scroll_anchor = Some(remaining);
++                    if event.pointer_count() <= 2 && self.scrolling {
++                        self.scrolling = false;
++                        events.push(scroll(remaining, Point::default(), TouchPhase::Ended));
++                    }
++                }
++            }
++            MotionAction::Up => {
++                if let Some((down_at, _)) = self.pending_down.take() {
++                    let click_count = self.click_count(down_at);
++                    events.push(PlatformInput::MouseDown(MouseDownEvent {
++                        button: MouseButton::Left,
++                        position: down_at,
++                        modifiers,
++                        click_count,
++                        first_mouse: false,
++                    }));
++                    events.push(PlatformInput::MouseUp(MouseUpEvent {
++                        button: MouseButton::Left,
++                        position: down_at,
++                        modifiers,
++                        click_count,
++                    }));
++                } else if self.scroll_anchor.take().is_none() && self.pressed.take().is_some() {
++                    self.scrolling = false;
++                    events.push(PlatformInput::MouseUp(MouseUpEvent {
++                        button: MouseButton::Left,
++                        position,
++                        modifiers,
++                        click_count: self.click_count_for_release(),
++                    }));
++                }
++            }
++            MotionAction::Cancel => {
++                self.pending_down = None;
++                if let Some(anchor) = self.scroll_anchor.take()
++                    && std::mem::take(&mut self.scrolling)
++                {
++                    events.push(scroll(anchor, Point::default(), TouchPhase::Ended));
++                }
++                if self.pressed.take().is_some() {
++                    events.push(PlatformInput::MouseUp(MouseUpEvent {
++                        button: MouseButton::Left,
++                        position,
++                        modifiers,
++                        click_count: self.click_count_for_release(),
++                    }));
++                }
++            }
++            _ => {}
++        }
++        events
++    }
++
++    /// Whether a touch is waiting for its hold time to pass before it becomes a press.
++    pub(crate) fn hold_pending(&self) -> bool {
++        self.pending_down.is_some()
++    }
++
++    /// Turns a touch held still for [`TOUCH_HOLD`] into a press, without waiting for it to move.
++    pub(crate) fn poll_hold(&mut self, modifiers: Modifiers) -> Option<PlatformInput> {
++        let (down_at, since) = self.pending_down?;
++        if since.elapsed() < TOUCH_HOLD {
++            return None;
++        }
++        self.pending_down = None;
++        self.pressed = Some(MouseButton::Left);
++        Some(PlatformInput::MouseDown(MouseDownEvent {
++            button: MouseButton::Left,
++            position: down_at,
++            modifiers,
++            click_count: self.click_count(down_at),
++            first_mouse: false,
++        }))
++    }
++
++    /// A key the soft keyboard sends through its InputConnection (usually delete or enter).
++    pub(crate) fn soft_key(key_code: i32, meta_state: i32, down: bool) -> Option<PlatformInput> {
++        let (key, key_char) = named_key(Keycode::from(key_code as u32))?;
++        let keystroke = Keystroke {
++            modifiers: modifiers_of(MetaState(meta_state as u32)),
++            key: key.to_string(),
++            key_char: key_char.map(str::to_string),
++        };
++        Some(if down {
++            PlatformInput::KeyDown(KeyDownEvent {
++                keystroke,
++                is_held: false,
++                prefer_character_input: false,
++            })
++        } else {
++            PlatformInput::KeyUp(KeyUpEvent { keystroke })
++        })
++    }
++
++    pub(crate) fn key(&mut self, app: &AndroidApp, event: &KeyEvent<'_>) -> Option<Translated> {
++        let meta = event.meta_state();
++        let mut modifiers = modifiers_of(meta);
++        let capslock = capslock_of(meta);
++        let key_code = event.key_code();
++
++        if is_modifier(key_code) {
++            return Some(Translated {
++                events: vec![PlatformInput::ModifiersChanged(ModifiersChangedEvent {
++                    modifiers,
++                    capslock,
++                })],
++                modifiers: Some((modifiers, capslock)),
++            });
++        }
++
++        let is_down = match event.action() {
++            KeyAction::Down => true,
++            KeyAction::Up => false,
++            _ => return None,
++        };
++
++        let (key, key_char) = match named_key(key_code) {
++            Some((name, key_char)) => (name.to_string(), key_char.map(str::to_string)),
++            None => {
++                let device_id = event.device_id();
++                let base = self.character(app, device_id, key_code, typing_meta(meta));
++                let alt_gr = if meta.alt_right_on() {
++                    self.character(
++                        app,
++                        device_id,
++                        key_code,
++                        MetaState(meta.0 & !META_CTRL_MASK),
++                    )
++                    .filter(|c| !c.is_control() && Some(*c) != base)
++                } else {
++                    None
++                };
++                let typed = match alt_gr {
++                    Some(c) => {
++                        modifiers.alt = false;
++                        modifiers.control = false;
++                        c
++                    }
++                    None => base?,
++                };
++                let key = if alt_gr.is_some() || typed.is_ascii_graphic() {
++                    typed.to_ascii_lowercase().to_string()
++                } else {
++                    self.character(app, device_id, key_code, MetaState(0))
++                        .filter(char::is_ascii_graphic)
++                        .unwrap_or(typed)
++                        .to_lowercase()
++                        .to_string()
++                };
++                if modifiers.shift && key.to_lowercase() == key.to_uppercase() {
++                    modifiers.shift = false;
++                }
++                let key_char = (!typed.is_control()).then(|| typed.to_string());
++                (key, key_char)
++            }
++        };
++
++        let keystroke = Keystroke {
++            modifiers,
++            key,
++            key_char,
++        };
++        let input = if is_down {
++            PlatformInput::KeyDown(KeyDownEvent {
++                keystroke,
++                is_held: event.repeat_count() > 0,
++                prefer_character_input: false,
++            })
++        } else {
++            PlatformInput::KeyUp(KeyUpEvent { keystroke })
++        };
++        Some(Translated {
++            events: vec![input],
++            modifiers: Some((modifiers_of(meta), capslock)),
++        })
++    }
++
++    fn character(
++        &mut self,
++        app: &AndroidApp,
++        device_id: i32,
++        key_code: Keycode,
++        meta: MetaState,
++    ) -> Option<char> {
++        if device_id == 0 {
++            return None;
++        }
++        let map = match self.key_maps.entry(device_id) {
++            Entry::Occupied(entry) => entry.into_mut(),
++            Entry::Vacant(entry) => match app.device_key_character_map(device_id) {
++                Ok(map) => entry.insert(map),
++                Err(_) => {
++                    log::warn!("gpui_android: no key character map (E_KCM)");
++                    return None;
++                }
++            },
++        };
++        match map.get(key_code, meta) {
++            Ok(KeyMapChar::Unicode(c)) => Some(c),
++            _ => None,
++        }
++    }
++}
++
++fn typing_meta(meta: MetaState) -> MetaState {
++    const SHIFT_AND_CAPS: u32 = 0x1 | 0x40 | 0x80 | 0x0010_0000;
++    MetaState(meta.0 & SHIFT_AND_CAPS)
++}
++
++fn held_button(state: u32) -> Option<MouseButton> {
++    const PRIMARY: u32 = 1;
++    const SECONDARY: u32 = 2;
++    const TERTIARY: u32 = 4;
++    if state & PRIMARY != 0 {
++        Some(MouseButton::Left)
++    } else if state & SECONDARY != 0 {
++        Some(MouseButton::Right)
++    } else if state & TERTIARY != 0 {
++        Some(MouseButton::Middle)
++    } else {
++        None
++    }
++}
++
++fn mouse_button(button: Button) -> MouseButton {
++    match button {
++        Button::Secondary | Button::StylusSecondary => MouseButton::Right,
++        Button::Tertiary => MouseButton::Middle,
++        _ => MouseButton::Left,
++    }
++}
++
++fn is_modifier(key_code: Keycode) -> bool {
++    matches!(
++        key_code,
++        Keycode::ShiftLeft
++            | Keycode::ShiftRight
++            | Keycode::CtrlLeft
++            | Keycode::CtrlRight
++            | Keycode::AltLeft
++            | Keycode::AltRight
++            | Keycode::MetaLeft
++            | Keycode::MetaRight
++            | Keycode::Function
++            | Keycode::CapsLock
++    )
++}
++
++fn named_key(key_code: Keycode) -> Option<(&'static str, Option<&'static str>)> {
++    Some(match key_code {
++        Keycode::Enter | Keycode::NumpadEnter => ("enter", None),
++        Keycode::Del => ("backspace", None),
++        Keycode::ForwardDel => ("delete", None),
++        Keycode::Tab => ("tab", None),
++        Keycode::Escape => ("escape", None),
++        Keycode::Space => ("space", Some(" ")),
++        Keycode::DpadLeft => ("left", None),
++        Keycode::DpadRight => ("right", None),
++        Keycode::DpadUp => ("up", None),
++        Keycode::DpadDown => ("down", None),
++        Keycode::MoveHome => ("home", None),
++        Keycode::MoveEnd => ("end", None),
++        Keycode::PageUp => ("pageup", None),
++        Keycode::PageDown => ("pagedown", None),
++        Keycode::Insert => ("insert", None),
++        Keycode::F1 => ("f1", None),
++        Keycode::F2 => ("f2", None),
++        Keycode::F3 => ("f3", None),
++        Keycode::F4 => ("f4", None),
++        Keycode::F5 => ("f5", None),
++        Keycode::F6 => ("f6", None),
++        Keycode::F7 => ("f7", None),
++        Keycode::F8 => ("f8", None),
++        Keycode::F9 => ("f9", None),
++        Keycode::F10 => ("f10", None),
++        Keycode::F11 => ("f11", None),
++        Keycode::F12 => ("f12", None),
++        _ => return None,
++    })
++}
+diff --git a/crates/gpui_android/src/logging.rs b/crates/gpui_android/src/logging.rs
+new file mode 100644
+index 0000000..40bb1e2
+--- /dev/null
++++ b/crates/gpui_android/src/logging.rs
+@@ -0,0 +1,22 @@
++use log::LevelFilter;
++
++pub fn init_logging() {
++    let max_level = if cfg!(debug_assertions) {
++        LevelFilter::Warn
++    } else {
++        LevelFilter::Error
++    };
++    // Only targets that log fixed codes reach logcat (F10): Zed's own crates can put paths or text in messages.
++    let filter = android_logger::FilterBuilder::new()
++        .filter_level(log::LevelFilter::Off)
++        // gpui_android logs codes only, so its informational codes (I_*) are kept in every build.
++        .filter_module("gpui_android", LevelFilter::Info.max(max_level))
++        .filter_module("zed_og", max_level)
++        .build();
++    android_logger::init_once(
++        android_logger::Config::default()
++            .with_max_level(LevelFilter::Info.max(max_level))
++            .with_filter(filter)
++            .with_tag("zed"),
++    );
++}
+diff --git a/crates/gpui_android/src/platform.rs b/crates/gpui_android/src/platform.rs
+new file mode 100644
+index 0000000..59a3f40
+--- /dev/null
++++ b/crates/gpui_android/src/platform.rs
+@@ -0,0 +1,781 @@
++use std::{
++    borrow::Cow,
++    cell::{Cell, RefCell},
++    path::{Path, PathBuf},
++    rc::{Rc, Weak},
++    sync::Arc,
++    time::{Duration, Instant},
++};
++
++use android_activity::{
++    AndroidApp, InputStatus, MainEvent, PollEvent,
++    input::{InputEvent, KeyAction, Keycode},
++    ndk::{configuration::UiModeNight, native_window::NativeWindow},
++};
++use anyhow::{Result, anyhow};
++use futures::channel::oneshot;
++use gpui::{
++    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
++    ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
++    PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
++    PlatformWindow, PriorityQueueReceiver, RunnableVariant, Task, ThermalState, WindowAppearance,
++    WindowParams,
++};
++use gpui_wgpu::{CosmicTextSystem, GpuContext};
++
++use crate::{
++    dispatcher::AndroidDispatcher,
++    display::AndroidDisplay,
++    ime::ImeEvent,
++    input::InputState,
++    window::{AndroidWindow, WindowInner},
++};
++
++const FRAME_INTERVAL: Duration = Duration::from_millis(16);
++// gpui throttles an inactive window to one frame per 33 ms and skips the frames in between, so keep ticking for a
++// few frames after the last one that drew before the loop is allowed to block.
++const IDLE_TICKS: u32 = 3;
++// A forced frame that keeps not drawing (or a GPU that keeps getting lost) is retried this many times, then the
++// loop is allowed to idle until the next event instead of waking at 60 Hz.
++const FORCE_RETRIES: u32 = 8;
++
++static FINISH_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++const MAIN_TASK_BUDGET: Duration = Duration::from_millis(8);
++
++static BUNDLED_FONTS: &[&[u8]] = &[
++    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
++    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
++    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
++    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf"),
++    include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf"),
++    include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf"),
++    include_bytes!("../../../assets/fonts/lilex/Lilex-Italic.ttf"),
++    include_bytes!("../../../assets/fonts/lilex/Lilex-BoldItalic.ttf"),
++];
++
++#[derive(Default)]
++struct Callbacks {
++    open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
++    quit: Option<Box<dyn FnMut()>>,
++    reopen: Option<Box<dyn FnMut()>>,
++    app_menu_action: Option<Box<dyn FnMut(&dyn Action)>>,
++    will_open_app_menu: Option<Box<dyn FnMut()>>,
++    validate_app_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
++    keyboard_layout_change: Option<Box<dyn FnMut()>>,
++    thermal_state_change: Option<Box<dyn FnMut()>>,
++}
++
++pub struct AndroidPlatform {
++    app: AndroidApp,
++    background_executor: BackgroundExecutor,
++    foreground_executor: ForegroundExecutor,
++    main_receiver: RefCell<PriorityQueueReceiver<RunnableVariant>>,
++    text_system: Arc<dyn PlatformTextSystem>,
++    gpu_context: GpuContext,
++    native_window: RefCell<Option<NativeWindow>>,
++    window: RefCell<Weak<WindowInner>>,
++    active_window: Cell<Option<AnyWindowHandle>>,
++    input: RefCell<InputState>,
++    clipboard: RefCell<Option<ClipboardItem>>,
++    callbacks: RefCell<Callbacks>,
++    resumed: Cell<bool>,
++    force_render: Cell<bool>,
++    quitting: Cell<bool>,
++    bottom_inset: Cell<i32>,
++    keyboard_shown: Cell<bool>,
++    paste_requested: Cell<bool>,
++}
++
++impl AndroidPlatform {
++    pub fn new(app: AndroidApp) -> Self {
++        let (main_sender, main_receiver) = PriorityQueueReceiver::new();
++        let dispatcher = Arc::new(AndroidDispatcher::new(main_sender, app.create_waker()));
++        crate::ime::set_waker(app.create_waker());
++        let background_executor = BackgroundExecutor::new(dispatcher.clone());
++        let foreground_executor = ForegroundExecutor::new(dispatcher);
++
++        let text_system = Arc::new(CosmicTextSystem::new_without_system_fonts("IBM Plex Sans"));
++        let fonts = BUNDLED_FONTS
++            .iter()
++            .map(|bytes| Cow::Borrowed(*bytes))
++            .collect();
++        if text_system.add_fonts(fonts).is_err() {
++            log::error!("gpui_android: bundled fonts failed to load (E_FONTS)");
++        }
++
++        Self {
++            app,
++            background_executor,
++            foreground_executor,
++            main_receiver: RefCell::new(main_receiver),
++            text_system,
++            gpu_context: Rc::new(RefCell::new(None)),
++            native_window: RefCell::new(None),
++            window: RefCell::new(Weak::new()),
++            active_window: Cell::new(None),
++            input: RefCell::new(InputState::default()),
++            clipboard: RefCell::new(None),
++            callbacks: RefCell::new(Callbacks::default()),
++            resumed: Cell::new(false),
++            force_render: Cell::new(true),
++            quitting: Cell::new(false),
++            bottom_inset: Cell::new(0),
++            keyboard_shown: Cell::new(false),
++            paste_requested: Cell::new(false),
++        }
++    }
++
++    fn scale_factor(&self) -> f32 {
++        self.app
++            .config()
++            .density()
++            .map_or(1., |dpi| dpi as f32 / 160.)
++    }
++
++    fn appearance(&self) -> WindowAppearance {
++        match self.app.config().ui_mode_night() {
++            UiModeNight::Yes => WindowAppearance::Dark,
++            _ => WindowAppearance::Light,
++        }
++    }
++
++    fn window(&self) -> Option<Rc<WindowInner>> {
++        let window = self.window.borrow().upgrade();
++        if window.is_none() {
++            self.active_window.set(None);
++        }
++        window
++    }
++
++    fn can_draw(&self) -> bool {
++        self.resumed.get() && self.window().is_some_and(|window| window.has_surface())
++    }
++
++    fn handle_main_event(&self, event: MainEvent<'_>) {
++        match event {
++            MainEvent::InitWindow { .. } => {
++                let native_window = self.app.native_window();
++                *self.native_window.borrow_mut() = native_window.clone();
++                if let (Some(window), Some(native_window)) = (self.window(), native_window) {
++                    window.attach_surface(native_window);
++                }
++                self.force_render.set(true);
++            }
++            MainEvent::TerminateWindow { .. } => {
++                if let Some(window) = self.window() {
++                    window.detach_surface();
++                }
++                *self.native_window.borrow_mut() = None;
++            }
++            MainEvent::WindowResized { .. }
++            | MainEvent::ContentRectChanged { .. }
++            | MainEvent::ConfigChanged { .. } => {
++                if let Some(window) = self.window() {
++                    window.update_geometry(self.scale_factor());
++                    window.set_appearance(self.appearance());
++                }
++                self.force_render.set(true);
++            }
++            MainEvent::RedrawNeeded { .. } => self.force_render.set(true),
++            MainEvent::GainedFocus => {
++                if let Some(window) = self.window() {
++                    window.set_active(true);
++                }
++            }
++            MainEvent::LostFocus => {
++                if let Some(window) = self.window() {
++                    window.set_active(false);
++                }
++            }
++            MainEvent::Resume { .. } => {
++                self.resumed.set(true);
++                self.force_render.set(true);
++            }
++            MainEvent::Pause => self.resumed.set(false),
++            MainEvent::LowMemory => log::warn!("gpui_android: W_LOWMEM"),
++            MainEvent::Destroy => self.quitting.set(true),
++            _ => {}
++        }
++    }
++
++    fn drain_input(&self) -> bool {
++        let Ok(mut iter) = self.app.input_events_iter() else {
++            return false;
++        };
++        let mut any = false;
++        loop {
++            let mut pending = Vec::new();
++            let read = iter.next(|event| {
++                let Some(window) = self.window() else {
++                    return InputStatus::Unhandled;
++                };
++                match event {
++                    InputEvent::MotionEvent(motion) => {
++                        pending = self.input.borrow_mut().motion(
++                            motion,
++                            window.scale_factor(),
++                            window.modifiers(),
++                        );
++                        InputStatus::Handled
++                    }
++                    InputEvent::KeyEvent(key) if key.key_code() == Keycode::Back => {
++                        if key.action() == KeyAction::Up {
++                            self.handle_back(&window);
++                        }
++                        InputStatus::Handled
++                    }
++                    InputEvent::KeyEvent(key) => {
++                        let Some(translated) = self.input.borrow_mut().key(&self.app, key) else {
++                            return InputStatus::Unhandled;
++                        };
++                        if let Some((modifiers, capslock)) = translated.modifiers {
++                            window.set_modifiers(modifiers, capslock);
++                        }
++                        let mut handled = false;
++                        for event in translated.events {
++                            handled |= self.dispatch_input(&window, event);
++                        }
++                        if handled {
++                            InputStatus::Handled
++                        } else {
++                            InputStatus::Unhandled
++                        }
++                    }
++                    _ => InputStatus::Unhandled,
++                }
++            });
++            if let Some(window) = self.window() {
++                for event in pending {
++                    self.dispatch_input(&window, event);
++                }
++            }
++            if !read {
++                break;
++            }
++            any = true;
++        }
++        any
++    }
++
++    fn dispatch_input(&self, window: &WindowInner, event: PlatformInput) -> bool {
++        let position = match &event {
++            PlatformInput::MouseDown(event) => Some(event.position),
++            PlatformInput::MouseUp(event) => Some(event.position),
++            PlatformInput::MouseMove(event) => Some(event.position),
++            PlatformInput::ScrollWheel(event) => Some(event.position),
++            _ => None,
++        };
++        if let Some(position) = position {
++            window.set_mouse_position(position);
++        }
++        let is_tap = matches!(event, PlatformInput::MouseUp(_));
++        // The system clipboard is read only for an explicit paste keystroke (L5): other callers, such as the project
++        // panel's context menu, see the in-process clipboard and never trigger Android's paste notice.
++        self.paste_requested.set(matches!(
++            &event,
++            PlatformInput::KeyDown(key)
++                if key.keystroke.key == "paste"
++                    || (key.keystroke.key == "v" && key.keystroke.modifiers.control)
++                    || (key.keystroke.key == "insert" && key.keystroke.modifiers.shift)
++        ));
++        let handled = window.handle_input(event);
++        self.paste_requested.set(false);
++        // A tap in a text input brings the keyboard back after the user dismissed it.
++        if is_tap && window.has_input_handler() {
++            self.keyboard_shown.set(true);
++            crate::ime::show_keyboard(true);
++        }
++        handled
++    }
++
++    /// Back is sent as an `android_back` keystroke, a key name no upstream keymap binds (the default keymap maps
++    /// `back`, the mouse button, to pane::GoBack). The app binds it per context; if nothing handles it, the window is
++    /// asked whether it may close. The loop finishes the Activity once the window is gone.
++    fn handle_back(&self, window: &WindowInner) {
++        let back = |down| {
++            let keystroke = gpui::Keystroke {
++                modifiers: gpui::Modifiers::default(),
++                key: "android_back".into(),
++                key_char: None,
++            };
++            if down {
++                PlatformInput::KeyDown(gpui::KeyDownEvent {
++                    keystroke,
++                    is_held: false,
++                    prefer_character_input: false,
++                })
++            } else {
++                PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke })
++            }
++        };
++        let handled = window.handle_input(back(true));
++        window.handle_input(back(false));
++        if !handled && window.should_close() {
++            self.quit();
++        }
++    }
++
++    fn apply_ime(&self) -> bool {
++        let events = crate::ime::drain();
++        if events.is_empty() {
++            return false;
++        }
++        let window = self.window();
++        for event in events {
++            if let ImeEvent::Insets { bottom } = event {
++                self.bottom_inset.set(bottom);
++                if let Some(window) = &window {
++                    window.set_bottom_inset(bottom);
++                }
++                self.force_render.set(true);
++                continue;
++            }
++            // Text and keys before the window exists have nowhere to go.
++            let Some(window) = &window else {
++                continue;
++            };
++            match event {
++                ImeEvent::Commit(text) => {
++                    window.with_input_handler(|handler| handler.replace_text_in_range(None, &text));
++                }
++                ImeEvent::Compose(text) => {
++                    window.with_input_handler(|handler| {
++                        handler.replace_and_mark_text_in_range(None, &text, None)
++                    });
++                }
++                ImeEvent::FinishComposing => {
++                    window.with_input_handler(|handler| handler.unmark_text());
++                }
++                ImeEvent::DeleteSurrounding { before, after } => {
++                    window.with_input_handler(|handler| {
++                        // Android's contract keeps the selection: delete after it first, then before it.
++                        if let Some(selection) = handler.selected_text_range(false) {
++                            let range = selection.range;
++                            if after > 0 {
++                                handler
++                                    .replace_text_in_range(Some(range.end..range.end + after), "");
++                            }
++                            if before > 0 {
++                                let start = range.start.saturating_sub(before);
++                                handler.replace_text_in_range(Some(start..range.start), "");
++                            }
++                        }
++                    });
++                }
++                ImeEvent::Insets { .. } => {}
++                ImeEvent::Back => self.handle_back(window),
++                ImeEvent::Key {
++                    key_code,
++                    meta_state,
++                    down,
++                } => {
++                    if let Some(input) = InputState::soft_key(key_code, meta_state, down) {
++                        self.dispatch_input(&window, input);
++                    }
++                }
++            }
++        }
++        true
++    }
++
++    /// Runs main-thread tasks for up to [`MAIN_TASK_BUDGET`]; returns (ran any, more pending).
++    fn run_main_tasks(&self) -> (bool, bool) {
++        let started = Instant::now();
++        let mut ran = false;
++        loop {
++            let runnable = self.main_receiver.borrow_mut().try_pop();
++            match runnable {
++                Ok(Some(runnable)) => {
++                    runnable.run();
++                    ran = true;
++                    if started.elapsed() >= MAIN_TASK_BUDGET {
++                        return (ran, true);
++                    }
++                }
++                Ok(None) | Err(_) => return (ran, false),
++            }
++        }
++    }
++}
++
++jni::bind_java_type! {
++    Activity => "android.app.Activity",
++    methods {
++        fn finish(),
++    }
++}
++
++fn finish_activity() {
++    let app = crate::android_app();
++    // SAFETY: vm_as_ptr is the process JavaVM, valid for the process lifetime.
++    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) };
++    let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
++        let raw = app.activity_as_ptr() as jni::sys::jobject;
++        // SAFETY: an unowned global reference that stays valid while `app` is alive; the cast takes no ownership.
++        let activity = unsafe { env.as_cast_raw::<jni::refs::Global<Activity>>(&raw)? };
++        activity.finish(env)
++    });
++    if result.is_err() {
++        log::error!("gpui_android: E_FINISH");
++        // Without a finished Activity there is no Destroy; let the loop end on its own instead.
++        FINISH_FAILED.store(true, std::sync::atomic::Ordering::Release);
++        crate::ime::wake();
++    }
++}
++
++fn ceil_millis(duration: Duration) -> Duration {
++    Duration::from_millis(duration.as_micros().div_ceil(1000) as u64)
++}
++
++impl Platform for AndroidPlatform {
++    fn background_executor(&self) -> BackgroundExecutor {
++        self.background_executor.clone()
++    }
++
++    fn foreground_executor(&self) -> ForegroundExecutor {
++        self.foreground_executor.clone()
++    }
++
++    fn text_system(&self) -> Arc<dyn PlatformTextSystem> {
++        self.text_system.clone()
++    }
++
++    fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
++        let mut on_finish_launching = Some(on_finish_launching);
++        let mut last_frame = Instant::now() - FRAME_INTERVAL;
++        let mut more_tasks = false;
++        let mut frame_wanted = true;
++        let mut idle_ticks = 0;
++        let mut force_retries = 0;
++        let mut had_window = false;
++        let mut finishing = false;
++
++        while !self.quitting.get() {
++            if FINISH_FAILED.swap(false, std::sync::atomic::Ordering::Acquire) {
++                break;
++            }
++            // The workspace closed its window (Back, or a close action): there is nothing left to show, so finish the
++            // Activity. gpui also calls quit() when its last window goes; Activity.finish() is idempotent.
++            let has_window = self.window().is_some();
++            if had_window && !has_window && !finishing {
++                finishing = true;
++                self.quit();
++            }
++            had_window |= has_window;
++            let launch_ready =
++                on_finish_launching.is_some() && self.native_window.borrow().is_some();
++            let timeout = if more_tasks || launch_ready {
++                Some(Duration::ZERO)
++            } else if frame_wanted && self.can_draw() {
++                Some(ceil_millis(
++                    FRAME_INTERVAL.saturating_sub(last_frame.elapsed()),
++                ))
++            } else {
++                None
++            };
++
++            let mut woke = false;
++            self.app.poll_events(timeout, |event| match event {
++                PollEvent::Main(event) => {
++                    woke = true;
++                    self.handle_main_event(event);
++                }
++                PollEvent::Wake => woke = true,
++                _ => {}
++            });
++            woke |= self.drain_input();
++            woke |= self.apply_ime();
++            if let Some(window) = self.window() {
++                let press = self.input.borrow_mut().poll_hold(window.modifiers());
++                if let Some(press) = press {
++                    self.dispatch_input(&window, press);
++                    woke = true;
++                }
++            }
++
++            if self.native_window.borrow().is_some()
++                && let Some(launch) = on_finish_launching.take()
++            {
++                launch();
++                woke = true;
++            }
++
++            let (ran, more) = self.run_main_tasks();
++            more_tasks = more;
++            if woke || ran {
++                frame_wanted = true;
++                idle_ticks = 0;
++            }
++            frame_wanted |= self.input.borrow().hold_pending();
++
++            if frame_wanted && self.can_draw() && last_frame.elapsed() >= FRAME_INTERVAL {
++                last_frame = Instant::now();
++                if let Some(window) = self.window() {
++                    let force = self.force_render.replace(false);
++                    window.request_frame(force);
++                    let drew = window.take_drew();
++                    let wants_keyboard = window.has_input_handler() && window.is_active();
++                    if wants_keyboard != self.keyboard_shown.get() {
++                        self.keyboard_shown.set(wants_keyboard);
++                        crate::ime::show_keyboard(wants_keyboard);
++                    }
++                    let retry = (force && !drew) || window.take_needs_force();
++                    force_retries = if retry { force_retries + 1 } else { 0 };
++                    if retry && force_retries <= FORCE_RETRIES {
++                        self.force_render.set(true);
++                    }
++                    if drew || self.force_render.get() {
++                        idle_ticks = 0;
++                    } else {
++                        idle_ticks += 1;
++                    }
++                    frame_wanted = idle_ticks < IDLE_TICKS;
++                }
++            }
++        }
++
++        if let Some(window) = self.window() {
++            window.close();
++        }
++        let quit = self.callbacks.borrow_mut().quit.take();
++        if let Some(mut quit) = quit {
++            quit();
++        }
++        // android_main runs once per Activity but the process outlives it, and GPUI's globals (and
++        // Zed's) can't be initialised twice, so a relaunch must start in a fresh process.
++        std::process::exit(0);
++    }
++
++    fn quit(&self) {
++        // Finish the Activity; the loop then runs until Destroy and exits from there.
++        self.app.run_on_java_main_thread(Box::new(finish_activity));
++    }
++
++    fn restart(&self, _binary_path: Option<PathBuf>) {}
++
++    fn activate(&self, _ignoring_other_apps: bool) {}
++
++    fn hide(&self) {}
++
++    fn hide_other_apps(&self) {}
++
++    fn unhide_other_apps(&self) {}
++
++    fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
++        self.primary_display().into_iter().collect()
++    }
++
++    fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
++        let native_window = self.native_window.borrow();
++        let native_window = native_window.as_ref()?;
++        let scale = self.scale_factor();
++        let bounds = gpui::Bounds {
++            origin: gpui::Point::default(),
++            size: gpui::size(
++                gpui::px(native_window.width() as f32 / scale),
++                gpui::px(native_window.height() as f32 / scale),
++            ),
++        };
++        Some(Rc::new(AndroidDisplay::new(bounds, bounds)))
++    }
++
++    fn active_window(&self) -> Option<AnyWindowHandle> {
++        self.active_window.get()
++    }
++
++    fn open_window(
++        &self,
++        handle: AnyWindowHandle,
++        _params: WindowParams,
++    ) -> Result<Box<dyn PlatformWindow>> {
++        if self.window().is_some() {
++            return Err(anyhow!("Android supports a single window"));
++        }
++        let native_window = self
++            .native_window
++            .borrow()
++            .clone()
++            .ok_or_else(|| anyhow!("no native window yet"))?;
++        let new_window = |native_window| {
++            AndroidWindow::new(
++                handle,
++                self.gpu_context.clone(),
++                native_window,
++                self.scale_factor(),
++                self.appearance(),
++            )
++        };
++        let (window, inner) = match new_window(native_window.clone()) {
++            Ok(created) => created,
++            // A forced backend (files/zed/wgpu-backend) without a usable adapter: report it and use the default choice.
++            Err(_) if gpui_wgpu::WgpuContext::backend_override_active() => {
++                log::info!("gpui_android: I_WGPU_NONE");
++                gpui_wgpu::WgpuContext::disable_backend_override();
++                self.gpu_context.borrow_mut().take();
++                new_window(native_window)?
++            }
++            Err(error) => return Err(error),
++        };
++        inner.set_bottom_inset(self.bottom_inset.get());
++        match self
++            .gpu_context
++            .borrow()
++            .as_ref()
++            .map(|context| context.adapter.get_info().backend)
++        {
++            Some(gpui_wgpu::wgpu::Backend::Vulkan) => log::info!("gpui_android: I_WGPU_VULKAN"),
++            Some(gpui_wgpu::wgpu::Backend::Gl) => log::info!("gpui_android: I_WGPU_GL"),
++            Some(_) => log::info!("gpui_android: I_WGPU_OTHER"),
++            None => log::info!("gpui_android: I_WGPU_NONE"),
++        }
++        *self.window.borrow_mut() = Rc::downgrade(&inner);
++        self.active_window.set(Some(handle));
++        self.force_render.set(true);
++        Ok(Box::new(window))
++    }
++
++    fn window_appearance(&self) -> WindowAppearance {
++        self.appearance()
++    }
++
++    fn open_url(&self, _url: &str) {}
++
++    fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
++        self.callbacks.borrow_mut().open_urls = Some(callback);
++    }
++
++    fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
++        Task::ready(Ok(()))
++    }
++
++    fn prompt_for_paths(
++        &self,
++        _options: PathPromptOptions,
++    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
++        let (tx, rx) = oneshot::channel();
++        tx.send(Ok(None)).ok();
++        rx
++    }
++
++    fn prompt_for_new_path(
++        &self,
++        _directory: &Path,
++        _suggested_name: Option<&str>,
++    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
++        let (tx, rx) = oneshot::channel();
++        tx.send(Ok(None)).ok();
++        rx
++    }
++
++    fn can_select_mixed_files_and_dirs(&self) -> bool {
++        false
++    }
++
++    fn reveal_path(&self, _path: &Path) {}
++
++    fn open_with_system(&self, _path: &Path) {}
++
++    fn on_quit(&self, callback: Box<dyn FnMut()>) {
++        self.callbacks.borrow_mut().quit = Some(callback);
++    }
++
++    fn on_reopen(&self, callback: Box<dyn FnMut()>) {
++        self.callbacks.borrow_mut().reopen = Some(callback);
++    }
++
++    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}
++
++    fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
++
++    fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>) {
++        self.callbacks.borrow_mut().app_menu_action = Some(callback);
++    }
++
++    fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>) {
++        self.callbacks.borrow_mut().will_open_app_menu = Some(callback);
++    }
++
++    fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>) {
++        self.callbacks.borrow_mut().validate_app_menu_command = Some(callback);
++    }
++
++    fn thermal_state(&self) -> ThermalState {
++        ThermalState::Nominal
++    }
++
++    fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>) {
++        self.callbacks.borrow_mut().thermal_state_change = Some(callback);
++    }
++
++    fn compositor_name(&self) -> &'static str {
++        "Android"
++    }
++
++    fn app_path(&self) -> Result<PathBuf> {
++        Err(anyhow!("app_path is not available on Android"))
++    }
++
++    fn path_for_auxiliary_executable(&self, _name: &str) -> Result<PathBuf> {
++        Err(anyhow!(
++            "auxiliary executables are not available on Android"
++        ))
++    }
++
++    fn set_cursor_style(&self, _style: CursorStyle) {}
++
++    fn should_auto_hide_scrollbars(&self) -> bool {
++        true
++    }
++
++    fn read_from_clipboard(&self) -> Option<ClipboardItem> {
++        if self.paste_requested.get()
++            && let Some(text) = crate::ime::read_clipboard()
++        {
++            return Some(ClipboardItem::new_string(text));
++        }
++        self.clipboard.borrow().clone()
++    }
++
++    fn write_to_clipboard(&self, item: ClipboardItem) {
++        if let Some(text) = item.text() {
++            crate::ime::write_clipboard(&text);
++        }
++        *self.clipboard.borrow_mut() = Some(item);
++    }
++
++    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
++        Task::ready(Err(anyhow!("credential storage is not available")))
++    }
++
++    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
++        Task::ready(Ok(None))
++    }
++
++    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
++        Task::ready(Err(anyhow!("credential storage is not available")))
++    }
++
++    fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
++        Box::new(AndroidKeyboardLayout)
++    }
++
++    fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
++        Rc::new(DummyKeyboardMapper)
++    }
++
++    fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
++        self.callbacks.borrow_mut().keyboard_layout_change = Some(callback);
++    }
++}
++
++struct AndroidKeyboardLayout;
++
++impl PlatformKeyboardLayout for AndroidKeyboardLayout {
++    fn id(&self) -> &str {
++        "android"
++    }
++
++    fn name(&self) -> &str {
++        "Android"
++    }
++}
+diff --git a/crates/gpui_android/src/window.rs b/crates/gpui_android/src/window.rs
+new file mode 100644
+index 0000000..e0c1de0
+--- /dev/null
++++ b/crates/gpui_android/src/window.rs
+@@ -0,0 +1,585 @@
++use std::{
++    cell::{Cell, RefCell},
++    rc::Rc,
++    sync::Arc,
++};
++
++use futures::channel::oneshot;
++use gpui::{
++    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
++    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
++    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
++    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
++    WindowDecorations, px, size,
++};
++use gpui_wgpu::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
++use ndk::native_window::NativeWindow;
++use raw_window_handle::{
++    AndroidDisplayHandle, DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle,
++    RawDisplayHandle, WindowHandle,
++};
++
++use crate::display::AndroidDisplay;
++
++#[derive(Clone, Debug)]
++pub(crate) struct SurfaceHandle(pub(crate) NativeWindow);
++
++impl HasWindowHandle for SurfaceHandle {
++    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
++        self.0.window_handle()
++    }
++}
++
++impl HasDisplayHandle for SurfaceHandle {
++    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
++        Ok(android_display_handle())
++    }
++}
++
++fn android_display_handle() -> DisplayHandle<'static> {
++    // SAFETY: the Android display handle carries no pointers.
++    unsafe { DisplayHandle::borrow_raw(RawDisplayHandle::Android(AndroidDisplayHandle::new())) }
++}
++
++#[derive(Default)]
++struct Callbacks {
++    request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
++    input: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
++    active_status_change: Option<Box<dyn FnMut(bool)>>,
++    hover_status_change: Option<Box<dyn FnMut(bool)>>,
++    resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
++    moved: Option<Box<dyn FnMut()>>,
++    should_close: Option<Box<dyn FnMut() -> bool>>,
++    close: Option<Box<dyn FnOnce()>>,
++    appearance_changed: Option<Box<dyn FnMut()>>,
++    hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
++}
++
++struct State {
++    renderer: WgpuRenderer,
++    native_window: Option<NativeWindow>,
++    device_size: Size<DevicePixels>,
++    bottom_inset: i32,
++    scale_factor: f32,
++    appearance: WindowAppearance,
++    input_handler: Option<PlatformInputHandler>,
++    is_active: bool,
++    mouse_position: Point<Pixels>,
++    modifiers: Modifiers,
++    capslock: Capslock,
++}
++
++pub(crate) struct WindowInner {
++    gpu_context: GpuContext,
++    state: RefCell<State>,
++    callbacks: RefCell<Callbacks>,
++    drew: Cell<bool>,
++    needs_force: Cell<bool>,
++}
++
++pub(crate) struct AndroidWindow {
++    inner: Rc<WindowInner>,
++    _handle: AnyWindowHandle,
++}
++
++fn device_size_of(native_window: &NativeWindow) -> Size<DevicePixels> {
++    size(
++        DevicePixels(native_window.width().max(1)),
++        DevicePixels(native_window.height().max(1)),
++    )
++}
++
++fn surface_config(device_size: Size<DevicePixels>) -> WgpuSurfaceConfig {
++    WgpuSurfaceConfig {
++        size: device_size,
++        transparent: false,
++        preferred_present_mode: None,
++    }
++}
++
++impl AndroidWindow {
++    pub(crate) fn new(
++        handle: AnyWindowHandle,
++        gpu_context: GpuContext,
++        native_window: NativeWindow,
++        scale_factor: f32,
++        appearance: WindowAppearance,
++    ) -> anyhow::Result<(Self, Rc<WindowInner>)> {
++        let device_size = device_size_of(&native_window);
++        let renderer = WgpuRenderer::new(
++            gpu_context.clone(),
++            &SurfaceHandle(native_window.clone()),
++            surface_config(device_size),
++            None,
++        )?;
++        let inner = Rc::new(WindowInner {
++            gpu_context,
++            state: RefCell::new(State {
++                renderer,
++                native_window: Some(native_window),
++                device_size,
++                bottom_inset: 0,
++                scale_factor,
++                appearance,
++                input_handler: None,
++                is_active: true,
++                mouse_position: Point::default(),
++                modifiers: Modifiers::default(),
++                capslock: Capslock::default(),
++            }),
++            callbacks: RefCell::new(Callbacks::default()),
++            drew: Cell::new(false),
++            needs_force: Cell::new(false),
++        });
++        Ok((
++            Self {
++                inner: inner.clone(),
++                _handle: handle,
++            },
++            inner,
++        ))
++    }
++}
++
++impl WindowInner {
++    /// The part of the surface not covered by the navigation bar or the soft keyboard; GPUI lays out in it and the
++    /// covered strip at the bottom keeps the cleared background.
++    fn logical_size(state: &State) -> Size<Pixels> {
++        let height = (state.device_size.height.0 - state.bottom_inset).max(1);
++        size(
++            px(state.device_size.width.0 as f32 / state.scale_factor),
++            px(height as f32 / state.scale_factor),
++        )
++    }
++
++    pub(crate) fn set_bottom_inset(&self, bottom: i32) {
++        {
++            let mut state = self.state.borrow_mut();
++            if state.bottom_inset == bottom.max(0) {
++                return;
++            }
++            state.bottom_inset = bottom.max(0);
++        }
++        self.notify_resize();
++    }
++
++    pub(crate) fn has_surface(&self) -> bool {
++        self.state.borrow().native_window.is_some()
++    }
++
++    pub(crate) fn attach_surface(&self, native_window: NativeWindow) {
++        let device_size = device_size_of(&native_window);
++        let result = {
++            let context = self.gpu_context.borrow();
++            let Some(context) = context.as_ref() else {
++                log::error!("gpui_android: E_NO_GPU_CONTEXT");
++                return;
++            };
++            let mut state = self.state.borrow_mut();
++            state.device_size = device_size;
++            state.native_window = Some(native_window.clone());
++            state.renderer.replace_surface(
++                &SurfaceHandle(native_window),
++                surface_config(device_size),
++                &context.instance,
++            )
++        };
++        if result.is_err() {
++            log::error!("gpui_android: E_SURFACE");
++            self.state.borrow_mut().native_window = None;
++            return;
++        }
++        self.notify_resize();
++    }
++
++    pub(crate) fn detach_surface(&self) {
++        let mut state = self.state.borrow_mut();
++        state.renderer.release_surface();
++        state.native_window = None;
++    }
++
++    pub(crate) fn update_geometry(&self, scale_factor: f32) {
++        let changed = {
++            let mut state = self.state.borrow_mut();
++            let Some(native_window) = state.native_window.clone() else {
++                state.scale_factor = scale_factor;
++                return;
++            };
++            let device_size = device_size_of(&native_window);
++            let changed = device_size != state.device_size || scale_factor != state.scale_factor;
++            if device_size != state.device_size {
++                state.device_size = device_size;
++                state.renderer.update_drawable_size(device_size);
++            }
++            state.scale_factor = scale_factor;
++            changed
++        };
++        if changed {
++            self.notify_resize();
++        }
++    }
++
++    fn notify_resize(&self) {
++        let (logical_size, scale_factor) = {
++            let state = self.state.borrow();
++            (Self::logical_size(&state), state.scale_factor)
++        };
++        let callback = self.callbacks.borrow_mut().resize.take();
++        if let Some(mut callback) = callback {
++            callback(logical_size, scale_factor);
++            self.callbacks.borrow_mut().resize.get_or_insert(callback);
++        }
++    }
++
++    pub(crate) fn set_appearance(&self, appearance: WindowAppearance) {
++        {
++            let mut state = self.state.borrow_mut();
++            if state.appearance == appearance {
++                return;
++            }
++            state.appearance = appearance;
++        }
++        let callback = self.callbacks.borrow_mut().appearance_changed.take();
++        if let Some(mut callback) = callback {
++            callback();
++            self.callbacks
++                .borrow_mut()
++                .appearance_changed
++                .get_or_insert(callback);
++        }
++    }
++
++    pub(crate) fn set_active(&self, active: bool) {
++        self.state.borrow_mut().is_active = active;
++        let callback = self.callbacks.borrow_mut().active_status_change.take();
++        if let Some(mut callback) = callback {
++            callback(active);
++            self.callbacks
++                .borrow_mut()
++                .active_status_change
++                .get_or_insert(callback);
++        }
++    }
++
++    pub(crate) fn request_frame(&self, force_render: bool) {
++        if !self.has_surface() {
++            return;
++        }
++        let callback = self.callbacks.borrow_mut().request_frame.take();
++        if let Some(mut callback) = callback {
++            callback(RequestFrameOptions {
++                require_presentation: false,
++                force_render,
++            });
++            self.callbacks
++                .borrow_mut()
++                .request_frame
++                .get_or_insert(callback);
++        }
++    }
++
++    pub(crate) fn take_drew(&self) -> bool {
++        self.drew.replace(false)
++    }
++
++    pub(crate) fn take_needs_force(&self) -> bool {
++        self.needs_force.replace(false)
++    }
++
++    pub(crate) fn scale_factor(&self) -> f32 {
++        self.state.borrow().scale_factor
++    }
++
++    pub(crate) fn modifiers(&self) -> Modifiers {
++        self.state.borrow().modifiers
++    }
++
++    pub(crate) fn set_modifiers(&self, modifiers: Modifiers, capslock: Capslock) {
++        let mut state = self.state.borrow_mut();
++        state.modifiers = modifiers;
++        state.capslock = capslock;
++    }
++
++    pub(crate) fn set_mouse_position(&self, position: Point<Pixels>) {
++        self.state.borrow_mut().mouse_position = position;
++    }
++
++    pub(crate) fn handle_input(&self, input: PlatformInput) -> bool {
++        let callback = self.callbacks.borrow_mut().input.take();
++        if let Some(mut callback) = callback {
++            let result = callback(input.clone());
++            self.callbacks.borrow_mut().input.get_or_insert(callback);
++            if !result.propagate {
++                return true;
++            }
++        }
++        if let PlatformInput::KeyDown(event) = input
++            && event.keystroke.modifiers.is_subset_of(&Modifiers::shift())
++            && let Some(key_char) = &event.keystroke.key_char
++        {
++            let handler = self.state.borrow_mut().input_handler.take();
++            if let Some(mut handler) = handler {
++                handler.replace_text_in_range(None, key_char);
++                self.state.borrow_mut().input_handler.get_or_insert(handler);
++                return true;
++            }
++        }
++        false
++    }
++
++    pub(crate) fn is_active(&self) -> bool {
++        self.state.borrow().is_active
++    }
++
++    pub(crate) fn has_input_handler(&self) -> bool {
++        self.state.borrow().input_handler.is_some()
++    }
++
++    pub(crate) fn with_input_handler<R>(
++        &self,
++        f: impl FnOnce(&mut PlatformInputHandler) -> R,
++    ) -> Option<R> {
++        let mut handler = self.state.borrow_mut().input_handler.take()?;
++        let result = f(&mut handler);
++        self.state.borrow_mut().input_handler.get_or_insert(handler);
++        Some(result)
++    }
++
++    pub(crate) fn should_close(&self) -> bool {
++        let callback = self.callbacks.borrow_mut().should_close.take();
++        let Some(mut callback) = callback else {
++            return true;
++        };
++        let result = callback();
++        self.callbacks
++            .borrow_mut()
++            .should_close
++            .get_or_insert(callback);
++        result
++    }
++
++    pub(crate) fn close(&self) {
++        let callback = self.callbacks.borrow_mut().close.take();
++        if let Some(callback) = callback {
++            callback();
++        }
++    }
++}
++
++impl Drop for AndroidWindow {
++    fn drop(&mut self) {
++        self.inner.state.borrow_mut().renderer.destroy();
++    }
++}
++
++impl HasWindowHandle for AndroidWindow {
++    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
++        let state = self.inner.state.borrow();
++        let native_window = state
++            .native_window
++            .as_ref()
++            .ok_or(HandleError::Unavailable)?;
++        let raw = native_window.window_handle()?.as_raw();
++        // SAFETY: everything here runs on the android_main thread. TerminateWindow is handled inside
++        // poll_events on that thread, never while a caller holds this handle, and it clears
++        // native_window before Android releases the surface.
++        Ok(unsafe { WindowHandle::borrow_raw(raw) })
++    }
++}
++
++impl HasDisplayHandle for AndroidWindow {
++    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
++        Ok(android_display_handle())
++    }
++}
++
++impl PlatformWindow for AndroidWindow {
++    fn bounds(&self) -> Bounds<Pixels> {
++        Bounds {
++            origin: Point::default(),
++            size: self.content_size(),
++        }
++    }
++
++    fn is_maximized(&self) -> bool {
++        true
++    }
++
++    fn window_bounds(&self) -> WindowBounds {
++        WindowBounds::Fullscreen(self.bounds())
++    }
++
++    fn content_size(&self) -> Size<Pixels> {
++        WindowInner::logical_size(&self.inner.state.borrow())
++    }
++
++    fn resize(&mut self, _size: Size<Pixels>) {}
++
++    fn scale_factor(&self) -> f32 {
++        self.inner.scale_factor()
++    }
++
++    fn appearance(&self) -> WindowAppearance {
++        self.inner.state.borrow().appearance
++    }
++
++    fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
++        let bounds = self.bounds();
++        Some(Rc::new(AndroidDisplay::new(bounds, bounds)))
++    }
++
++    fn mouse_position(&self) -> Point<Pixels> {
++        self.inner.state.borrow().mouse_position
++    }
++
++    fn modifiers(&self) -> Modifiers {
++        self.inner.modifiers()
++    }
++
++    fn capslock(&self) -> Capslock {
++        self.inner.state.borrow().capslock
++    }
++
++    fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
++        self.inner.state.borrow_mut().input_handler = Some(input_handler);
++    }
++
++    fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
++        self.inner.state.borrow_mut().input_handler.take()
++    }
++
++    fn prompt(
++        &self,
++        _level: PromptLevel,
++        _msg: &str,
++        _detail: Option<&str>,
++        _answers: &[PromptButton],
++    ) -> Option<oneshot::Receiver<usize>> {
++        None
++    }
++
++    fn activate(&self) {}
++
++    fn is_active(&self) -> bool {
++        self.inner.state.borrow().is_active
++    }
++
++    fn is_hovered(&self) -> bool {
++        false
++    }
++
++    fn background_appearance(&self) -> WindowBackgroundAppearance {
++        WindowBackgroundAppearance::Opaque
++    }
++
++    fn set_title(&mut self, _title: &str) {}
++
++    fn set_background_appearance(&self, _background_appearance: WindowBackgroundAppearance) {}
++
++    fn minimize(&self) {}
++
++    fn zoom(&self) {}
++
++    fn toggle_fullscreen(&self) {}
++
++    fn is_fullscreen(&self) -> bool {
++        true
++    }
++
++    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
++        self.inner.callbacks.borrow_mut().request_frame = Some(callback);
++    }
++
++    fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
++        self.inner.callbacks.borrow_mut().input = Some(callback);
++    }
++
++    fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
++        self.inner.callbacks.borrow_mut().active_status_change = Some(callback);
++    }
++
++    fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
++        self.inner.callbacks.borrow_mut().hover_status_change = Some(callback);
++    }
++
++    fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
++        self.inner.callbacks.borrow_mut().resize = Some(callback);
++    }
++
++    fn on_moved(&self, callback: Box<dyn FnMut()>) {
++        self.inner.callbacks.borrow_mut().moved = Some(callback);
++    }
++
++    fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
++        self.inner.callbacks.borrow_mut().should_close = Some(callback);
++    }
++
++    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
++        self.inner.callbacks.borrow_mut().hit_test_window_control = Some(callback);
++    }
++
++    fn on_close(&self, callback: Box<dyn FnOnce()>) {
++        self.inner.callbacks.borrow_mut().close = Some(callback);
++    }
++
++    fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
++        self.inner.callbacks.borrow_mut().appearance_changed = Some(callback);
++    }
++
++    fn draw(&self, scene: &Scene) {
++        let mut state = self.inner.state.borrow_mut();
++        let Some(native_window) = state.native_window.clone() else {
++            return;
++        };
++        if state.renderer.device_lost() {
++            if state
++                .renderer
++                .recover(&SurfaceHandle(native_window))
++                .is_err()
++            {
++                log::error!("gpui_android: E_GPU_RECOVER");
++            }
++            self.inner.needs_force.set(true);
++            return;
++        }
++        state.renderer.draw(scene);
++        self.inner.drew.set(true);
++    }
++
++    fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
++        self.inner.state.borrow().renderer.sprite_atlas().clone()
++    }
++
++    fn is_subpixel_rendering_supported(&self) -> bool {
++        false
++    }
++
++    fn gpu_specs(&self) -> Option<GpuSpecs> {
++        Some(self.inner.state.borrow().renderer.gpu_specs())
++    }
++
++    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
++
++    fn request_decorations(&self, _decorations: WindowDecorations) {}
++
++    fn show_window_menu(&self, _position: Point<Pixels>) {}
++
++    fn start_window_move(&self) {}
++
++    fn start_window_resize(&self, _edge: ResizeEdge) {}
++
++    fn window_decorations(&self) -> Decorations {
++        Decorations::Server
++    }
++
++    fn window_controls(&self) -> WindowControls {
++        WindowControls {
++            fullscreen: false,
++            maximize: false,
++            minimize: false,
++            window_menu: false,
++        }
++    }
++
++    fn set_client_inset(&self, _inset: Pixels) {}
++}
+diff --git a/crates/gpui_platform/Cargo.toml b/crates/gpui_platform/Cargo.toml
+index 22d44a9..e4ba25e 100644
+--- a/crates/gpui_platform/Cargo.toml
++++ b/crates/gpui_platform/Cargo.toml
+@@ -33,6 +33,9 @@ gpui = { workspace = true, features = ["windows-manifest"] }
+ [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ gpui_linux.workspace = true
+ 
++[target.'cfg(target_os = "android")'.dependencies]
++gpui_android.workspace = true
++
+ [target.'cfg(target_family = "wasm")'.dependencies]
+ gpui_web.workspace = true
+ console_error_panic_hook = "0.1.7"
+diff --git a/crates/gpui_platform/src/gpui_platform.rs b/crates/gpui_platform/src/gpui_platform.rs
+index 1d2fea9..814cc0b 100644
+--- a/crates/gpui_platform/src/gpui_platform.rs
++++ b/crates/gpui_platform/src/gpui_platform.rs
+@@ -52,6 +52,14 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
+         gpui_linux::current_platform(headless)
+     }
+ 
++    #[cfg(target_os = "android")]
++    {
++        let _ = headless;
++        Rc::new(gpui_android::AndroidPlatform::new(
++            gpui_android::android_app(),
++        ))
++    }
++
+     #[cfg(target_family = "wasm")]
+     {
+         let _ = headless;
+diff --git a/crates/gpui_wgpu/src/wgpu_context.rs b/crates/gpui_wgpu/src/wgpu_context.rs
+index 2662a92..8ea8366 100644
+--- a/crates/gpui_wgpu/src/wgpu_context.rs
++++ b/crates/gpui_wgpu/src/wgpu_context.rs
+@@ -6,6 +6,9 @@ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use wgpu::TextureFormat;
+ 
++#[cfg(target_os = "android")]
++static BACKEND_OVERRIDE_OFF: AtomicBool = AtomicBool::new(false);
++
+ pub struct WgpuContext {
+     pub instance: wgpu::Instance,
+     pub adapter: wgpu::Adapter,
+@@ -163,7 +166,7 @@ impl WgpuContext {
+     #[cfg(not(target_family = "wasm"))]
+     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+         wgpu::Instance::new(wgpu::InstanceDescriptor {
+-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
++            backends: Self::backends(),
+             flags: wgpu::InstanceFlags::default(),
+             backend_options: wgpu::BackendOptions::default(),
+             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+@@ -171,6 +174,41 @@ impl WgpuContext {
+         })
+     }
+ 
++    /// Vulkan with GL as fallback. On Android, WGPU_BACKEND (validated by the app) can pick one for an A/B test.
++    #[cfg(not(target_family = "wasm"))]
++    fn backends() -> wgpu::Backends {
++        let default = wgpu::Backends::VULKAN | wgpu::Backends::GL;
++        #[cfg(target_os = "android")]
++        if let Some(backends) = Self::backend_override() {
++            return backends;
++        }
++        default
++    }
++
++    #[cfg(target_os = "android")]
++    fn backend_override() -> Option<wgpu::Backends> {
++        if BACKEND_OVERRIDE_OFF.load(Ordering::Acquire) {
++            return None;
++        }
++        let default = wgpu::Backends::VULKAN | wgpu::Backends::GL;
++        wgpu::Backends::from_env()
++            .filter(|backends| backends.intersects(default))
++            .map(|backends| backends & default)
++    }
++
++    /// Whether WGPU_BACKEND currently narrows the backend choice.
++    #[cfg(target_os = "android")]
++    pub fn backend_override_active() -> bool {
++        Self::backend_override().is_some()
++    }
++
++    /// Ignores WGPU_BACKEND for the rest of the process, so the next context uses the default choice. Used when the
++    /// forced backend has no adapter for the window; the environment itself is left alone (other threads read it).
++    #[cfg(target_os = "android")]
++    pub fn disable_backend_override() {
++        BACKEND_OVERRIDE_OFF.store(true, Ordering::Release);
++    }
++
+     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
+         let caps = surface.get_capabilities(&self.adapter);
+         if caps.formats.is_empty() {
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index c38de02..af8e0af 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -107,7 +107,7 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
+ struct WgpuResources {
+     device: Arc<wgpu::Device>,
+     queue: Arc<wgpu::Queue>,
+-    surface: wgpu::Surface<'static>,
++    surface: Option<wgpu::Surface<'static>>,
+     pipelines: WgpuPipelines,
+     bind_group_layouts: WgpuBindGroupLayouts,
+     atlas_sampler: wgpu::Sampler,
+@@ -437,7 +437,7 @@ impl WgpuRenderer {
+         let resources = WgpuResources {
+             device,
+             queue,
+-            surface,
++            surface: Some(surface),
+             pipelines,
+             bind_group_layouts,
+             atlas_sampler,
+@@ -966,9 +966,9 @@ impl WgpuRenderer {
+                 texture.destroy();
+             }
+ 
+-            resources
+-                .surface
+-                .configure(&resources.device, &surface_config);
++            if let Some(surface) = &resources.surface {
++                surface.configure(&resources.device, &surface_config);
++            }
+ 
+             // Invalidate intermediate textures - they will be lazily recreated
+             // in draw() after we confirm the surface is healthy. This avoids
+@@ -1021,9 +1021,9 @@ impl WgpuRenderer {
+             let path_sample_count = self.rendering_params.path_sample_count;
+             let dual_source_blending = self.dual_source_blending;
+             let resources = self.resources_mut();
+-            resources
+-                .surface
+-                .configure(&resources.device, &surface_config);
++            if let Some(surface) = &resources.surface {
++                surface.configure(&resources.device, &surface_config);
++            }
+             resources.pipelines = Self::create_pipelines(
+                 &resources.device,
+                 &resources.bind_group_layouts,
+@@ -1089,24 +1089,27 @@ impl WgpuRenderer {
+ 
+         self.atlas.before_frame();
+ 
+-        let frame = match self.resources().surface.get_current_texture() {
++        let Some(surface) = self.resources().surface.as_ref() else {
++            return;
++        };
++        let frame = match surface.get_current_texture() {
+             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                 // Textures must be destroyed before the surface can be reconfigured.
+                 drop(frame);
+                 let surface_config = self.surface_config.clone();
+                 let resources = self.resources_mut();
+-                resources
+-                    .surface
+-                    .configure(&resources.device, &surface_config);
++                if let Some(surface) = &resources.surface {
++                    surface.configure(&resources.device, &surface_config);
++                }
+                 return;
+             }
+             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                 let surface_config = self.surface_config.clone();
+                 let resources = self.resources_mut();
+-                resources
+-                    .surface
+-                    .configure(&resources.device, &surface_config);
++                if let Some(surface) = &resources.surface {
++                    surface.configure(&resources.device, &surface_config);
++                }
+                 return;
+             }
+             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+@@ -1675,6 +1678,15 @@ impl WgpuRenderer {
+         }
+     }
+ 
++    /// Drops the surface and its swapchain but keeps the device, atlas and pipelines, so a later
++    /// [`replace_surface`](Self::replace_surface) can resume without losing cached atlas textures.
++    pub fn release_surface(&mut self) {
++        self.unconfigure_surface();
++        if let Some(res) = self.resources.as_mut() {
++            res.surface = None;
++        }
++    }
++
+     /// Replace the wgpu surface with a new one (e.g. after Android destroys
+     /// and recreates the native window).  Keeps the device, queue, atlas, and
+     /// all pipelines intact so cached `AtlasTextureId`s remain valid.
+@@ -1718,7 +1730,7 @@ impl WgpuRenderer {
+                 .as_mut()
+                 .expect("GPU resources not available");
+             surface.configure(&res.device, &self.surface_config);
+-            res.surface = surface;
++            res.surface = Some(surface);
+ 
+             // Invalidate intermediate textures — they'll be recreated lazily.
+             res.path_intermediate_texture = None;

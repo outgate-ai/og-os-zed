@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OG OS <og-os@invalid>
+Date: Fri, 24 Apr 2026 21:41:32 +0000
+Subject: [PATCH 4/5] Add gpui_android and zed_og to the workspace
+
+The two members and the locked dependencies of the Android targets.
+---
+ Cargo.lock | 178 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ Cargo.toml |  19 +++++-
+ 2 files changed, 190 insertions(+), 7 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 58ad54e..abcf5d4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -558,6 +558,48 @@ dependencies = [
+  "url",
+ ]
+ 
++[[package]]
++name = "android-activity"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0f2a1bb052857d5dd49572219344a7332b31b76405648eabac5bc68978251bcd"
++dependencies = [
++ "android-properties",
++ "bitflags 2.10.0",
++ "cc",
++ "jni 0.22.4",
++ "libc",
++ "log",
++ "ndk",
++ "ndk-context",
++ "ndk-sys",
++ "num_enum",
++ "thiserror 2.0.17",
++]
++
++[[package]]
++name = "android-properties"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
++
++[[package]]
++name = "android_log-sys"
++version = "0.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "84521a3cf562bc62942e294181d9eef17eb38ceb8c68677bc49f144e4c3d4f8d"
++
++[[package]]
++name = "android_logger"
++version = "0.15.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dbb4e440d04be07da1f1bf44fb4495ebd58669372fe0cffa6e48595ac5bd88a3"
++dependencies = [
++ "android_log-sys",
++ "env_filter",
++ "log",
++]
++
+ [[package]]
+ name = "android_system_properties"
+ version = "0.1.5"
+@@ -3842,7 +3884,7 @@ dependencies = [
+  "alsa",
+  "coreaudio-rs 0.13.0",
+  "dasp_sample",
+- "jni",
++ "jni 0.21.1",
+  "js-sys",
+  "libc",
+  "mach2 0.5.0",
+@@ -7602,6 +7644,25 @@ dependencies = [
+  "zed-scap",
+ ]
+ 
++[[package]]
++name = "gpui_android"
++version = "0.1.0"
++dependencies = [
++ "android-activity",
++ "android_logger",
++ "anyhow",
++ "futures 0.3.32",
++ "gpui",
++ "gpui_platform",
++ "gpui_wgpu",
++ "jni 0.22.4",
++ "log",
++ "ndk",
++ "raw-window-handle",
++ "unicode-segmentation",
++ "uuid",
++]
++
+ [[package]]
+ name = "gpui_linux"
+ version = "0.1.0"
+@@ -7709,6 +7770,7 @@ version = "0.1.0"
+ dependencies = [
+  "console_error_panic_hook",
+  "gpui",
++ "gpui_android",
+  "gpui_linux",
+  "gpui_macos",
+  "gpui_web",
+@@ -9033,19 +9095,68 @@ dependencies = [
+  "cesu8",
+  "cfg-if",
+  "combine",
+- "jni-sys",
++ "jni-sys 0.3.0",
+  "log",
+  "thiserror 1.0.69",
+  "walkdir",
+  "windows-sys 0.45.0",
+ ]
+ 
++[[package]]
++name = "jni"
++version = "0.22.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5efd9a482cf3a427f00d6b35f14332adc7902ce91efb778580e180ff90fa3498"
++dependencies = [
++ "cfg-if",
++ "combine",
++ "jni-macros",
++ "jni-sys 0.4.1",
++ "log",
++ "simd_cesu8",
++ "thiserror 2.0.17",
++ "walkdir",
++ "windows-link 0.2.1",
++]
++
++[[package]]
++name = "jni-macros"
++version = "0.22.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a00109accc170f0bdb141fed3e393c565b6f5e072365c3bd58f5b062591560a3"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "rustc_version",
++ "simd_cesu8",
++ "syn 2.0.117",
++]
++
+ [[package]]
+ name = "jni-sys"
+ version = "0.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8eaf4bc02d17cbdd7ff4c7438cafcdf7fb9a4613313ad11b4f8fefe7d3fa0130"
+ 
++[[package]]
++name = "jni-sys"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c6377a88cb3910bee9b0fa88d4f42e1d2da8e79915598f65fb0c7ee14c878af2"
++dependencies = [
++ "jni-sys-macros",
++]
++
++[[package]]
++name = "jni-sys-macros"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
++dependencies = [
++ "quote",
++ "syn 2.0.117",
++]
++
+ [[package]]
+ name = "jobserver"
+ version = "0.1.34"
+@@ -9797,7 +9908,7 @@ source = "git+https://github.com/zed-industries/livekit-rust-sdks?rev=147fbca3d4
+ dependencies = [
+  "cxx",
+  "glib",
+- "jni",
++ "jni 0.21.1",
+  "js-sys",
+  "lazy_static",
+  "livekit-protocol",
+@@ -10898,10 +11009,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c3f42e7bbe13d351b6bead8286a43aac9534b82bd3cc43e47037f012ebfd62d4"
+ dependencies = [
+  "bitflags 2.10.0",
+- "jni-sys",
++ "jni-sys 0.3.0",
+  "log",
+  "ndk-sys",
+  "num_enum",
++ "raw-window-handle",
+  "thiserror 1.0.69",
+ ]
+ 
+@@ -10917,7 +11029,7 @@ version = "0.6.0+11769913"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
+ dependencies = [
+- "jni-sys",
++ "jni-sys 0.3.0",
+ ]
+ 
+ [[package]]
+@@ -15159,7 +15271,7 @@ checksum = "19787cda76408ec5404443dc8b31795c87cd8fec49762dc75fa727740d34acc1"
+ dependencies = [
+  "core-foundation 0.10.0",
+  "core-foundation-sys",
+- "jni",
++ "jni 0.21.1",
+  "log",
+  "once_cell",
+  "rustls 0.23.33",
+@@ -16136,6 +16248,16 @@ version = "0.3.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d66dc143e6b11c1eddc06d5c423cfc97062865baf299914ab64caa38182078fe"
+ 
++[[package]]
++name = "simd_cesu8"
++version = "1.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11031e251abf8611c80f460e19dbdeb54a66db918e49c65a7065b46ac7aec520"
++dependencies = [
++ "rustc_version",
++ "simdutf8",
++]
++
+ [[package]]
+ name = "simd_helpers"
+ version = "0.1.0"
+@@ -22486,6 +22608,50 @@ dependencies = [
+  "zed_extension_api 0.7.0",
+ ]
+ 
++[[package]]
++name = "zed_og"
++version = "0.1.0"
++dependencies = [
++ "anyhow",
++ "assets",
++ "client",
++ "command_palette",
++ "command_palette_hooks",
++ "db",
++ "editor",
++ "feature_flags",
++ "file_finder",
++ "fs",
++ "go_to_line",
++ "gpui",
++ "gpui_android",
++ "gpui_platform",
++ "gpui_tokio",
++ "http_client",
++ "language",
++ "languages",
++ "libc",
++ "log",
++ "menu",
++ "node_runtime",
++ "outline",
++ "paths",
++ "project",
++ "project_panel",
++ "release_channel",
++ "search",
++ "session",
++ "settings",
++ "tab_switcher",
++ "theme",
++ "theme_settings",
++ "ui_prompt",
++ "util",
++ "uuid",
++ "workspace",
++ "zed_actions",
++]
++
+ [[package]]
+ name = "zed_proto"
+ version = "0.3.2"
+diff --git a/Cargo.toml b/Cargo.toml
+index 02fb7c1..8c353f8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -89,6 +89,7 @@ members = [
+     "crates/google_ai",
+     "crates/grammars",
+     "crates/gpui",
++    "crates/gpui_android",
+     "crates/gpui_shared_string",
+     "crates/gpui_linux",
+     "crates/gpui_macos",
+@@ -225,6 +226,7 @@ members = [
+     "crates/x_ai",
+     "crates/zed",
+     "crates/zed_actions",
++    "crates/zed_og",
+     "crates/zed_credentials_provider",
+     "crates/zed_env_vars",
+     "crates/zeta_prompt",
+@@ -341,6 +343,7 @@ go_to_line = { path = "crates/go_to_line" }
+ google_ai = { path = "crates/google_ai" }
+ grammars = { path = "crates/grammars" }
+ gpui = { path = "crates/gpui", default-features = false }
++gpui_android = { path = "crates/gpui_android" }
+ gpui_shared_string = { path = "crates/gpui_shared_string" }
+ gpui_linux = { path = "crates/gpui_linux", default-features = false }
+ gpui_macos = { path = "crates/gpui_macos", default-features = false }
+@@ -480,6 +483,7 @@ worktree = { path = "crates/worktree" }
+ x_ai = { path = "crates/x_ai" }
+ zed = { path = "crates/zed" }
+ zed_actions = { path = "crates/zed_actions" }
++zed_og = { path = "crates/zed_og" }
+ zed_credentials_provider = { path = "crates/zed_credentials_provider" }
+ zed_env_vars = { path = "crates/zed_env_vars" }
+ edit_prediction = { path = "crates/edit_prediction" }
+@@ -497,6 +501,8 @@ ztracing_macro = { path = "crates/ztracing_macro" }
+ agent-client-protocol = { version = "=0.10.2", features = ["unstable"] }
+ aho-corasick = "1.1"
+ alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "9d9640d4" }
++android-activity = { version = "0.6.1", features = ["native-activity"] }
++android_logger = { version = "0.15.1", default-features = false }
+ any_vec = "0.14"
+ anyhow = "1.0.86"
+ ashpd = { version = "0.13", default-features = false, features = [
+@@ -599,6 +605,7 @@ indexmap = { version = "2.7.0", features = ["serde"] }
+ indoc = "2"
+ inventory = "0.3.19"
+ itertools = "0.14.0"
++jni = "0.22.4"
+ json_dotpath = "1.1"
+ jsonschema = "0.37.0"
+ jsonwebtoken = "10.0"
+@@ -619,6 +626,7 @@ moka = { version = "0.12.10", features = ["sync"] }
+ naga = { version = "29.0", features = ["wgsl-in"] }
+ nanoid = "0.4"
+ nbformat = "1.2.0"
++ndk = { version = "0.9.0", default-features = false }
+ nix = "0.29"
+ nucleo = "0.5"
+ num-format = "0.4.4"
+@@ -751,7 +759,7 @@ toml_edit = { version = "0.22", default-features = false, features = [
+     "serde",
+ ] }
+ tower-http = "0.4.4"
+-tree-sitter = { version = "0.26.8", features = ["wasm"] }
++tree-sitter = "0.26.8"
+ tree-sitter-bash = "0.25.1"
+ tree-sitter-c = "0.24.1"
+ tree-sitter-cpp = { git = "https://github.com/tree-sitter/tree-sitter-cpp", rev = "5cb9b693cfd7bfacab1d9ff4acac1a4150700609" }
+@@ -958,6 +966,15 @@ debug = "full"
+ lto = false
+ codegen-units = 16
+ 
++[profile.og-poc]
++inherits = "release"
++panic = "abort"
++opt-level = 2
++debug = false
++strip = "symbols"
++lto = false
++codegen-units = 16
++
+ [workspace.lints.rust]
+ unexpected_cfgs = { level = "allow" }
+ 

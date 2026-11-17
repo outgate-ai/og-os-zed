@@ -1,0 +1,9 @@
+release        unreleased (tag og-os-unreleased of og-os-zed when released)
+upstream       Zed v0.233.10, commit 350f33871e84d5ed83a403523e9490b9bf014a94, tree a2c0a7964e212f11ed6e8198e51b739ce7f48c76
+               tarball sha256 PIN-ME
+patches        5, sha256 of the series (cat patches/*.patch):
+               4dbabefb2fc097d644c192b60c0da6074ddb9c9db6ddc7d1e277b7565a35cd20
+Cargo.lock     sha256 24561a90541eb5e73c2d20c571353ff0f418b702b549fbce5271394023a17c6a
+toolchain      Rust 1.94.1, NDK r30, base docker.io/library/ubuntu:24.04@sha256:PIN-ME, apt snapshot PIN-ME
+build          cargo build --locked -p zed_og --profile og-poc --target <aarch64|x86_64>-linux-android,
+               SOURCE_DATE_EPOCH=1777066892, in build/zed.sh's sandbox
