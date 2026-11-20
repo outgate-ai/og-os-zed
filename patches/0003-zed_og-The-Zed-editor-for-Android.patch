@@ -7,20 +7,30 @@ A cdylib entry point that runs the editor on gpui_android without network, AI,
 collaboration, terminal or language-server features, with settings and key bindings
 for a phone (Back, a docked project panel, the search bar) and codes-only logging.
 ---
- crates/zed_og/Cargo.toml    |  53 ++++++
- crates/zed_og/LICENSE-GPL   |   1 +
- crates/zed_og/src/zed_og.rs | 362 ++++++++++++++++++++++++++++++++++++
- 3 files changed, 416 insertions(+)
+ crates/zed_og/Cargo.toml       |  57 ++++
+ crates/zed_og/LICENSE-GPL      |   1 +
+ crates/zed_og/src/app_menu.rs  | 359 ++++++++++++++++++++++++
+ crates/zed_og/src/filter.rs    | 100 +++++++
+ crates/zed_og/src/pending.rs   |  65 +++++
+ crates/zed_og/src/zed_og.rs    | 481 +++++++++++++++++++++++++++++++++
+ crates/zed_og/tests/filter.rs  |   3 +
+ crates/zed_og/tests/pending.rs |   3 +
+ 8 files changed, 1069 insertions(+)
  create mode 100644 crates/zed_og/Cargo.toml
  create mode 120000 crates/zed_og/LICENSE-GPL
+ create mode 100644 crates/zed_og/src/app_menu.rs
+ create mode 100644 crates/zed_og/src/filter.rs
+ create mode 100644 crates/zed_og/src/pending.rs
  create mode 100644 crates/zed_og/src/zed_og.rs
+ create mode 100644 crates/zed_og/tests/filter.rs
+ create mode 100644 crates/zed_og/tests/pending.rs
 
 diff --git a/crates/zed_og/Cargo.toml b/crates/zed_og/Cargo.toml
 new file mode 100644
-index 0000000..2b25d16
+index 0000000..992f63a
 --- /dev/null
 +++ b/crates/zed_og/Cargo.toml
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,57 @@
 +[package]
 +name = "zed_og"
 +version = "0.1.0"
@@ -46,6 +56,7 @@ index 0000000..2b25d16
 +feature_flags.workspace = true
 +file_finder.workspace = true
 +fs.workspace = true
++futures.workspace = true
 +go_to_line.workspace = true
 +gpui.workspace = true
 +gpui_android.workspace = true
@@ -63,12 +74,15 @@ index 0000000..2b25d16
 +project.workspace = true
 +project_panel.workspace = true
 +release_channel.workspace = true
++schemars.workspace = true
 +search.workspace = true
++serde.workspace = true
 +session.workspace = true
 +settings.workspace = true
 +tab_switcher.workspace = true
 +theme.workspace = true
 +theme_settings.workspace = true
++ui.workspace = true
 +ui_prompt.workspace = true
 +util.workspace = true
 +uuid.workspace = true
@@ -82,15 +96,561 @@ index 0000000..89e542f
 @@ -0,0 +1 @@
 +../../LICENSE-GPL
 \ No newline at end of file
+diff --git a/crates/zed_og/src/app_menu.rs b/crates/zed_og/src/app_menu.rs
+new file mode 100644
+index 0000000..4d43938
+--- /dev/null
++++ b/crates/zed_og/src/app_menu.rs
+@@ -0,0 +1,359 @@
++//! The menu bar, drawn by the app: Android has no platform menu bar.
++//!
++//! The bar is adapted from Zed's crates/title_bar/src/application_menu.rs (v0.233.10), Copyright 2022 - 2025 Zed
++//! Industries, Inc., licensed GPL-3.0-or-later like this crate. Kept: one button and popover per menu, F10, and
++//! left/right between open menus. Changed: no title-bar settings or title bar; a narrow window shows one menu button
++//! with every menu in it; the menus are this build's (`og_menus`).
++
++use gpui::{Action, Entity, Menu, MenuItem, OwnedMenu, OwnedMenuItem, Pixels, actions, px};
++use schemars::JsonSchema;
++use serde::Deserialize;
++use ui::{ContextMenu, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
++
++use crate::filter;
++
++actions!(
++    app_menu,
++    [
++        /// Opens the menu to the right of the open one.
++        ActivateMenuRight,
++        /// Opens the menu to the left of the open one.
++        ActivateMenuLeft
++    ]
++);
++
++/// Opens the named menu; a name this build has no menu for opens the first one (the stock keymap's F10 names "Zed").
++#[derive(Clone, Deserialize, JsonSchema, PartialEq, Default, Action)]
++#[action(namespace = app_menu)]
++pub struct OpenApplicationMenu(String);
++
++/// Below this width the bar is one menu button.
++const NARROW: Pixels = px(600.);
++
++/// File, Edit, Selection, View and Go: what this build can do, nothing that needs a second window, a folder picker,
++/// a language server or a left-out feature. Anything [`filter::in_menu`] refuses is dropped (code logged).
++pub(crate) fn og_menus() -> Vec<Menu> {
++    let menus = vec![
++        Menu::new("File").items([
++            MenuItem::action("New File", workspace::NewFile),
++            MenuItem::separator(),
++            MenuItem::action("Save", workspace::Save { save_intent: None }),
++            MenuItem::action("Save All", workspace::SaveAll { save_intent: None }),
++            MenuItem::separator(),
++            MenuItem::action(
++                "Close Editor",
++                workspace::CloseActiveItem {
++                    save_intent: None,
++                    close_pinned: true,
++                },
++            ),
++            MenuItem::action("Close Window", workspace::CloseWindow),
++        ]),
++        Menu::new("Edit").items([
++            MenuItem::action("Undo", editor::actions::Undo),
++            MenuItem::action("Redo", editor::actions::Redo),
++            MenuItem::separator(),
++            MenuItem::action("Cut", editor::actions::Cut),
++            MenuItem::action("Copy", editor::actions::Copy),
++            MenuItem::action("Paste", editor::actions::Paste),
++            MenuItem::separator(),
++            MenuItem::action("Find", search::buffer_search::Deploy::find()),
++            MenuItem::action("Find in Project", workspace::DeploySearch::default()),
++            MenuItem::separator(),
++            MenuItem::action(
++                "Toggle Line Comment",
++                editor::actions::ToggleComments::default(),
++            ),
++        ]),
++        Menu::new("Selection").items([
++            MenuItem::action("Select All", editor::actions::SelectAll),
++            MenuItem::action("Expand Selection", editor::actions::SelectLargerSyntaxNode),
++            MenuItem::action("Shrink Selection", editor::actions::SelectSmallerSyntaxNode),
++            MenuItem::separator(),
++            MenuItem::action(
++                "Add Cursor Above",
++                editor::actions::AddSelectionAbove {
++                    skip_soft_wrap: true,
++                },
++            ),
++            MenuItem::action(
++                "Add Cursor Below",
++                editor::actions::AddSelectionBelow {
++                    skip_soft_wrap: true,
++                },
++            ),
++            MenuItem::action(
++                "Select Next Occurrence",
++                editor::actions::SelectNext {
++                    replace_newest: false,
++                },
++            ),
++            MenuItem::action("Select All Occurrences", editor::actions::SelectAllMatches),
++            MenuItem::separator(),
++            MenuItem::action("Move Line Up", editor::actions::MoveLineUp),
++            MenuItem::action("Move Line Down", editor::actions::MoveLineDown),
++            MenuItem::action("Duplicate Selection", editor::actions::DuplicateLineDown),
++        ]),
++        Menu::new("View").items([
++            MenuItem::action("Command Palette", zed_actions::command_palette::Toggle),
++            MenuItem::action("Project Panel", zed_actions::project_panel::ToggleFocus),
++            MenuItem::separator(),
++            MenuItem::action(
++                "Zoom In",
++                zed_actions::IncreaseBufferFontSize { persist: false },
++            ),
++            MenuItem::action(
++                "Zoom Out",
++                zed_actions::DecreaseBufferFontSize { persist: false },
++            ),
++            MenuItem::action(
++                "Reset Zoom",
++                zed_actions::ResetBufferFontSize { persist: false },
++            ),
++        ]),
++        Menu::new("Go").items([
++            MenuItem::action("Back", workspace::GoBack),
++            MenuItem::action("Forward", workspace::GoForward),
++            MenuItem::separator(),
++            MenuItem::action("Go to File…", workspace::ToggleFileFinder::default()),
++            MenuItem::action(
++                "Go to Symbol in Editor…",
++                zed_actions::outline::ToggleOutline,
++            ),
++            MenuItem::action("Go to Line/Column…", editor::actions::ToggleGoToLine),
++        ]),
++    ];
++    menus
++        .into_iter()
++        .map(|menu| Menu {
++            items: menu
++                .items
++                .into_iter()
++                .filter(|item| match item {
++                    MenuItem::Action { action, .. } => {
++                        let shown = filter::in_menu(action.name());
++                        if !shown {
++                            log::error!("zed_og: E_MENU_HIDDEN");
++                        }
++                        shown
++                    }
++                    _ => true,
++                })
++                .collect(),
++            ..menu
++        })
++        .collect()
++}
++
++#[derive(Clone)]
++struct MenuEntry {
++    menu: OwnedMenu,
++    handle: PopoverMenuHandle<ContextMenu>,
++}
++
++pub(crate) struct AppMenuBar {
++    entries: Vec<MenuEntry>,
++    /// The narrow window's single button.
++    all: PopoverMenuHandle<ContextMenu>,
++    pending_menu_open: Option<String>,
++}
++
++impl AppMenuBar {
++    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
++        let entries = cx
++            .get_menus()
++            .unwrap_or_default()
++            .into_iter()
++            .map(|menu| MenuEntry {
++                menu,
++                handle: PopoverMenuHandle::default(),
++            })
++            .collect();
++        Self {
++            entries,
++            all: PopoverMenuHandle::default(),
++            pending_menu_open: None,
++        }
++    }
++
++    fn sanitize_menu_items(items: Vec<OwnedMenuItem>) -> Vec<OwnedMenuItem> {
++        let mut cleaned = Vec::new();
++        let mut last_was_separator = true;
++        for item in items {
++            match item {
++                OwnedMenuItem::Separator => {
++                    if !last_was_separator {
++                        cleaned.push(item);
++                        last_was_separator = true;
++                    }
++                }
++                OwnedMenuItem::Submenu(ref submenu) if submenu.items.is_empty() => {}
++                OwnedMenuItem::SystemMenu(_) => {}
++                item => {
++                    cleaned.push(item);
++                    last_was_separator = false;
++                }
++            }
++        }
++        if let Some(OwnedMenuItem::Separator) = cleaned.last() {
++            cleaned.pop();
++        }
++        cleaned
++    }
++
++    fn add_items(menu: ContextMenu, items: Vec<OwnedMenuItem>) -> ContextMenu {
++        Self::sanitize_menu_items(items)
++            .into_iter()
++            .fold(menu, |menu, item| match item {
++                OwnedMenuItem::Separator => menu.separator(),
++                OwnedMenuItem::Action {
++                    name,
++                    action,
++                    checked,
++                    disabled,
++                    ..
++                } => menu.action_checked_with_disabled(name, action, checked, disabled),
++                OwnedMenuItem::Submenu(submenu) => Self::add_items(menu, submenu.items),
++                OwnedMenuItem::SystemMenu(_) => menu,
++            })
++    }
++
++    /// One popover with [`menus`]; with more than one, each starts under its name.
++    fn build_menu(menus: Vec<OwnedMenu>, window: &mut Window, cx: &mut App) -> Entity<ContextMenu> {
++        ContextMenu::build(window, cx, |menu, window, cx| {
++            // The focused element's actions run in its context (the editor's Copy, the pane's Close Editor).
++            let menu = menu.when_some(window.focused(cx), |menu, focused| menu.context(focused));
++            let headed = menus.len() > 1;
++            menus.into_iter().fold(menu, |menu, owned| {
++                let menu = if headed {
++                    menu.header(owned.name)
++                } else {
++                    menu
++                };
++                Self::add_items(menu, owned.items)
++            })
++        })
++    }
++
++    fn render_all_menus(&self) -> impl IntoElement {
++        let menus: Vec<OwnedMenu> = self
++            .entries
++            .iter()
++            .map(|entry| entry.menu.clone())
++            .collect();
++        div().id("og-menu-all").occlude().child(
++            PopoverMenu::new("og-menu-all-popover")
++                .menu(move |window, cx| Self::build_menu(menus.clone(), window, cx).into())
++                .trigger_with_tooltip(
++                    IconButton::new("og-menu-all-trigger", ui::IconName::Menu)
++                        .style(ButtonStyle::Subtle)
++                        .icon_size(IconSize::Small),
++                    Tooltip::text("Menu"),
++                )
++                .with_handle(self.all.clone()),
++        )
++    }
++
++    fn render_standard_menu(&self, entry: &MenuEntry) -> impl IntoElement {
++        let current_handle = entry.handle.clone();
++        let menu_name = entry.menu.name.clone();
++        let menu = entry.menu.clone();
++        let all_handles: Vec<_> = self
++            .entries
++            .iter()
++            .map(|entry| entry.handle.clone())
++            .collect();
++        div()
++            .id(format!("{}-menu-item", menu_name))
++            .occlude()
++            .child(
++                PopoverMenu::new(format!("{}-menu-popover", menu_name))
++                    .menu(move |window, cx| Self::build_menu(vec![menu.clone()], window, cx).into())
++                    .trigger(
++                        Button::new(
++                            SharedString::from(format!("{}-menu-trigger", menu_name)),
++                            menu_name,
++                        )
++                        .style(ButtonStyle::Subtle)
++                        .label_size(LabelSize::Small),
++                    )
++                    .with_handle(current_handle.clone()),
++            )
++            .on_hover(move |hover_enter, window, cx| {
++                if *hover_enter
++                    && all_handles.iter().any(|handle| handle.is_deployed())
++                    && !current_handle.is_deployed()
++                {
++                    all_handles.iter().for_each(|handle| handle.hide(cx));
++                    // Deferred so that this menu can take focus from the one it replaces.
++                    let handle = current_handle.clone();
++                    window.defer(cx, move |window, cx| handle.show(window, cx));
++                }
++            })
++    }
++
++    pub(crate) fn open_menu(&mut self, action: &OpenApplicationMenu, cx: &mut Context<Self>) {
++        self.pending_menu_open = Some(action.0.clone());
++        cx.notify();
++    }
++
++    pub(crate) fn navigate(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
++        let Some(current) = self
++            .entries
++            .iter()
++            .position(|entry| entry.handle.is_deployed())
++        else {
++            return;
++        };
++        let count = self.entries.len();
++        let next = if right {
++            (current + 1) % count
++        } else {
++            (current + count - 1) % count
++        };
++        self.entries[current].handle.hide(cx);
++        let handle = self.entries[next].handle.clone();
++        cx.defer_in(window, move |_, window, cx| handle.show(window, cx));
++    }
++}
++
++impl Render for AppMenuBar {
++    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let narrow = window.viewport_size().width < NARROW;
++        if let Some(name) = self.pending_menu_open.take() {
++            let target = if narrow {
++                Some(self.all.clone())
++            } else {
++                self.entries
++                    .iter()
++                    .find(|entry| entry.menu.name.as_ref() == name)
++                    .or(self.entries.first())
++                    .map(|entry| entry.handle.clone())
++            };
++            if let Some(handle) = target.filter(|handle| !handle.is_deployed()) {
++                self.entries.iter().for_each(|entry| entry.handle.hide(cx));
++                self.all.hide(cx);
++                cx.defer_in(window, move |_, window, cx| handle.show(window, cx));
++            }
++        }
++        h_flex()
++            .key_context("ApplicationMenu")
++            .w_full()
++            .h(px(32.))
++            .px_1()
++            .gap_x_1()
++            .bg(cx.theme().colors().title_bar_background)
++            .border_b_1()
++            .border_color(cx.theme().colors().border_variant)
++            .when(narrow && !self.entries.is_empty(), |bar| {
++                bar.child(self.render_all_menus())
++            })
++            .when(!narrow, |bar| {
++                bar.children(
++                    self.entries
++                        .iter()
++                        .map(|entry| self.render_standard_menu(entry)),
++                )
++            })
++    }
++}
+diff --git a/crates/zed_og/src/filter.rs b/crates/zed_og/src/filter.rs
+new file mode 100644
+index 0000000..853693a
+--- /dev/null
++++ b/crates/zed_og/src/filter.rs
+@@ -0,0 +1,100 @@
++//! Which actions this build shows (command palette and menus). Names only, so the rule is tested on the host.
++#![cfg_attr(not(target_os = "android"), allow(dead_code))]
++
++/// Namespaces of features this build never initialises; their actions must not show in the palette or a menu.
++pub(crate) const HIDDEN_NAMESPACES: &[&str] = &[
++    "agent",
++    "assistant",
++    "auto_update",
++    "call",
++    "channel_modal",
++    "client",
++    "collab",
++    "copilot",
++    "edit_prediction",
++    "extensions",
++    "feedback",
++    "git_panel",
++    "language_models",
++    "terminal",
++    "git",
++    "zeta",
++];
++
++/// Actions a menu never offers: trust (unbound on purpose), a second window or a folder picker (the app has one
++/// window and no file system outside its own storage), and the actions of features left out.
++pub(crate) const NOT_IN_MENUS: &[&str] = &[
++    "workspace::ToggleWorktreeSecurity",
++    "workspace::NewWindow",
++    "workspace::Open",
++    "workspace::OpenFiles",
++    "workspace::AddFolderToProject",
++    "workspace::CloseProject",
++    "projects::OpenRecent",
++    "projects::OpenRemote",
++];
++
++/// Whether a menu may offer the action named `name` (`namespace::Name`).
++pub(crate) fn in_menu(name: &str) -> bool {
++    let Some((namespace, _)) = name.split_once("::") else {
++        return false;
++    };
++    !namespace.is_empty()
++        && !HIDDEN_NAMESPACES.contains(&namespace)
++        && !NOT_IN_MENUS.contains(&name)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::in_menu;
++
++    #[test]
++    fn editing_saving_and_navigation_are_offered() {
++        for name in [
++            "workspace::Save",
++            "workspace::SaveAll",
++            "pane::CloseActiveItem",
++            "editor::Undo",
++            "editor::Paste",
++            "buffer_search::Deploy",
++            "command_palette::Toggle",
++            "file_finder::Toggle",
++            "go_to_line::Toggle",
++        ] {
++            assert!(in_menu(name), "{name}");
++        }
++    }
++
++    #[test]
++    fn left_out_features_are_never_offered() {
++        for name in [
++            "terminal::Toggle",
++            "git::Commit",
++            "agent::NewThread",
++            "collab::ToggleMute",
++            "extensions::Install",
++            "auto_update::Check",
++        ] {
++            assert!(!in_menu(name), "{name}");
++        }
++    }
++
++    #[test]
++    fn trust_a_second_window_and_folder_pickers_are_never_offered() {
++        for name in [
++            "workspace::ToggleWorktreeSecurity",
++            "workspace::NewWindow",
++            "workspace::Open",
++            "workspace::OpenFiles",
++            "projects::OpenRecent",
++        ] {
++            assert!(!in_menu(name), "{name}");
++        }
++    }
++
++    #[test]
++    fn a_name_without_a_namespace_is_not_offered() {
++        assert!(!in_menu("Save"));
++        assert!(!in_menu(""));
++    }
++}
+diff --git a/crates/zed_og/src/pending.rs b/crates/zed_og/src/pending.rs
+new file mode 100644
+index 0000000..27a1322
+--- /dev/null
++++ b/crates/zed_og/src/pending.rs
+@@ -0,0 +1,65 @@
++//! ZED2 F3: shared files that arrive before the first workspace window exists wait for it. Plain state, so the rule
++//! is tested on the host.
++#![cfg_attr(not(target_os = "android"), allow(dead_code))]
++
++use std::path::PathBuf;
++
++#[derive(Default)]
++pub(crate) struct PendingOpens {
++    ready: bool,
++    queue: Vec<PathBuf>,
++}
++
++impl PendingOpens {
++    /// A shared file's copy arrived: the path to open now, or None while it waits for the first window.
++    pub(crate) fn arrive(&mut self, path: PathBuf) -> Option<PathBuf> {
++        if self.ready {
++            return Some(path);
++        }
++        if !self.queue.contains(&path) {
++            self.queue.push(path);
++        }
++        None
++    }
++
++    /// A workspace window appeared: the paths to open in it. Only the first window takes them, each once.
++    pub(crate) fn window_ready(&mut self) -> Vec<PathBuf> {
++        self.ready = true;
++        std::mem::take(&mut self.queue)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::PendingOpens;
++    use std::path::PathBuf;
++
++    fn p(name: &str) -> PathBuf {
++        PathBuf::from(format!("/files/projects/external/t/{name}"))
++    }
++
++    #[test]
++    fn a_path_before_the_window_opens_once_when_it_appears() {
++        let mut pending = PendingOpens::default();
++        assert_eq!(pending.arrive(p("notes.txt")), None);
++        assert_eq!(pending.window_ready(), vec![p("notes.txt")]);
++        assert_eq!(pending.window_ready(), Vec::<PathBuf>::new());
++    }
++
++    #[test]
++    fn a_path_after_the_window_opens_at_once_and_is_not_queued() {
++        let mut pending = PendingOpens::default();
++        assert_eq!(pending.window_ready(), Vec::<PathBuf>::new());
++        assert_eq!(pending.arrive(p("notes.txt")), Some(p("notes.txt")));
++        assert_eq!(pending.window_ready(), Vec::<PathBuf>::new());
++    }
++
++    #[test]
++    fn the_same_path_twice_before_the_window_opens_once_and_order_is_kept() {
++        let mut pending = PendingOpens::default();
++        assert_eq!(pending.arrive(p("a.txt")), None);
++        assert_eq!(pending.arrive(p("b.txt")), None);
++        assert_eq!(pending.arrive(p("a.txt")), None);
++        assert_eq!(pending.window_ready(), vec![p("a.txt"), p("b.txt")]);
++    }
++}
 diff --git a/crates/zed_og/src/zed_og.rs b/crates/zed_og/src/zed_og.rs
 new file mode 100644
-index 0000000..991c5ed
+index 0000000..9b035be
 --- /dev/null
 +++ b/crates/zed_og/src/zed_og.rs
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,481 @@
 +//! Zed for OG OS: the editor without collaboration, accounts, AI, extensions, the terminal, language servers or
 +//! updates. The app has no network permission, and nothing here creates a network client.
 +#![cfg(target_os = "android")]
++
++mod app_menu;
++mod filter;
++mod pending;
 +
 +use std::{path::PathBuf, sync::Arc};
 +
@@ -102,6 +662,7 @@ index 0000000..991c5ed
 +use http_client::BlockedHttpClient;
 +use language::LanguageRegistry;
 +use node_runtime::NodeRuntime;
++use pending::PendingOpens;
 +use project_panel::ProjectPanel;
 +use session::{AppSession, Session};
 +use settings::{KeymapFile, SettingsStore};
@@ -122,26 +683,6 @@ index 0000000..991c5ed
 +  "project_panel": { "dock": "left", "starts_open": false },
 +  "file_finder": { "modal_max_width": "full" }
 +}"#;
-+
-+// Namespaces of features this build never initialises; their actions must not show in the command palette.
-+const HIDDEN_NAMESPACES: &[&str] = &[
-+    "agent",
-+    "assistant",
-+    "auto_update",
-+    "call",
-+    "channel_modal",
-+    "client",
-+    "collab",
-+    "copilot",
-+    "edit_prediction",
-+    "extensions",
-+    "feedback",
-+    "git_panel",
-+    "language_models",
-+    "terminal",
-+    "git",
-+    "zeta",
-+];
 +
 +const SAMPLE_FILES: &[(&str, &str)] = &[
 +    (
@@ -266,6 +807,13 @@ index 0000000..991c5ed
 +        KeyValueStore::from_app_db(&app_db),
 +    ));
 +    let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, app.background_executor()));
++
++    // ZED2 F3: the platform hands over the local copy of a file another app shared (OG Terminal's `zed <file>`); the
++    // callback has no App, so the paths go through a channel to a task inside the app.
++    let (opened_tx, mut opened_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
++    app.on_open_urls(move |paths| {
++        opened_tx.unbounded_send(paths).ok();
++    });
 +
 +    app.run(move |cx| {
 +        cx.set_global(app_db);
@@ -392,7 +940,7 @@ index 0000000..991c5ed
 +        .detach();
 +
 +        command_palette_hooks::CommandPaletteFilter::update_global(cx, |filter, _| {
-+            for namespace in HIDDEN_NAMESPACES {
++            for namespace in filter::HIDDEN_NAMESPACES {
 +                filter.hide_namespace(namespace);
 +            }
 +            filter.hide_action_types(&[
@@ -403,19 +951,118 @@ index 0000000..991c5ed
 +            ]);
 +        });
 +
++        // Android has no menu bar: the menus are kept by gpui_android and drawn by app_menu's bar at the top of the
++        // workspace (F10 and the bar's buttons open them).
++        cx.set_menus(app_menu::og_menus());
++
++        // ZED2 F3: open a shared file's copy (only under files/projects/external/) in the window, and end the other
++        // app's grant when its editor closes (ExternalFiles, the ItemRemoved handler below).
++        cx.set_global(ExternalFiles::default());
++        cx.set_global(PendingOpens::default());
++        let external = project_dir
++            .parent()
++            .map(|p| p.join("external"))
++            .unwrap_or_default();
++        cx.spawn(async move |cx| {
++            use futures::StreamExt as _;
++            while let Some(paths) = opened_rx.next().await {
++                for path in paths {
++                    let path = PathBuf::from(path);
++                    let inside = match (path.canonicalize(), external.canonicalize()) {
++                        (Ok(p), Ok(e)) => p.starts_with(e),
++                        _ => false,
++                    };
++                    if !inside {
++                        log::error!("zed_og: E_OPEN_EXTERNAL");
++                        continue;
++                    }
++                    // Before the first workspace window the path waits; the observe_new hook below opens it.
++                    cx.update(|cx| {
++                        let Some(path) = cx.global_mut::<PendingOpens>().arrive(path) else {
++                            return;
++                        };
++                        let opened = workspace::local_workspace_windows(cx)
++                            .into_iter()
++                            .next()
++                            .and_then(|window| {
++                                window
++                                    .update(cx, |multi, window, cx| {
++                                        multi.workspace().update(cx, |workspace, cx| {
++                                            open_external(workspace, path, window, cx)
++                                        })
++                                    })
++                                    .ok()
++                            });
++                        if opened.is_none() {
++                            log::error!("zed_og: E_OPEN_NO_WINDOW");
++                        }
++                    });
++                }
++            }
++        })
++        .detach();
++
 +        cx.observe_new(|workspace: &mut Workspace, window, cx| {
 +            let Some(window) = window else {
 +                return;
 +            };
++            let bar = cx.new(app_menu::AppMenuBar::new);
++            workspace.set_titlebar_item(bar.clone().into(), window, cx);
++            let open = bar.downgrade();
++            workspace.register_action(move |_, action: &app_menu::OpenApplicationMenu, _, cx| {
++                open.update(cx, |bar, cx| bar.open_menu(action, cx)).ok();
++            });
++            let left = bar.downgrade();
++            workspace.register_action(move |_, _: &app_menu::ActivateMenuLeft, window, cx| {
++                left.update(cx, |bar, cx| bar.navigate(false, window, cx))
++                    .ok();
++            });
++            let right = bar.downgrade();
++            workspace.register_action(move |_, _: &app_menu::ActivateMenuRight, window, cx| {
++                right
++                    .update(cx, |bar, cx| bar.navigate(true, window, cx))
++                    .ok();
++            });
 +            let center_pane = workspace.active_pane().clone();
 +            add_search_bar(workspace, &center_pane, window, cx);
 +            let handle = cx.entity();
-+            cx.subscribe_in(&handle, window, |workspace, _, event, window, cx| {
-+                if let workspace::Event::PaneAdded(pane) = event {
-+                    add_search_bar(workspace, pane, window, cx);
-+                }
-+            })
++            cx.subscribe_in(
++                &handle,
++                window,
++                |workspace, _, event, window, cx| match event {
++                    workspace::Event::PaneAdded(pane) => {
++                        add_search_bar(workspace, pane, window, cx)
++                    }
++                    workspace::Event::ItemRemoved { item_id } => {
++                        // The item may still be open in another pane: release only when it's gone everywhere.
++                        if workspace.items(cx).any(|item| item.item_id() == *item_id) {
++                            return;
++                        }
++                        let path: Option<PathBuf> =
++                            cx.global_mut::<ExternalFiles>().0.remove(item_id);
++                        if let Some(path) = path {
++                            gpui_android::release_external(&path.to_string_lossy());
++                        }
++                    }
++                    _ => {}
++                },
++            )
 +            .detach();
++            // Shared files that arrived before this, the first window: open each once it is set up.
++            let queued = cx.global_mut::<PendingOpens>().window_ready();
++            if !queued.is_empty() {
++                cx.spawn_in(window, async move |workspace, cx| {
++                    for path in queued {
++                        let opened = workspace.update_in(cx, |workspace, window, cx| {
++                            open_external(workspace, path, window, cx)
++                        });
++                        if opened.is_err() {
++                            log::error!("zed_og: E_OPEN_NO_WINDOW");
++                        }
++                    }
++                })
++                .detach();
++            }
 +            cx.spawn_in(window, async move |workspace, cx| {
 +                let panel = ProjectPanel::load(workspace.clone(), cx.clone()).await?;
 +                workspace.update_in(cx, |workspace, window, cx| {
@@ -436,6 +1083,34 @@ index 0000000..991c5ed
 +    });
 +}
 +
++/// ZED2 F3: editors showing a shared file (item id -> its local copy), so closing one ends the other app's grant.
++#[derive(Default)]
++struct ExternalFiles(std::collections::HashMap<gpui::EntityId, PathBuf>);
++
++impl gpui::Global for ExternalFiles {}
++
++impl gpui::Global for PendingOpens {}
++
++/// Opens a shared file's local copy in `workspace` and remembers its editor, so closing it ends the grant.
++fn open_external(
++    workspace: &mut Workspace,
++    path: PathBuf,
++    window: &mut gpui::Window,
++    cx: &mut gpui::Context<Workspace>,
++) {
++    let task = workspace.open_abs_path(path.clone(), OpenOptions::default(), window, cx);
++    cx.spawn(async move |_, cx| match task.await {
++        Ok(item) => {
++            let id = item.item_id();
++            cx.update(|cx| {
++                cx.global_mut::<ExternalFiles>().0.insert(id, path);
++            });
++        }
++        Err(_) => log::error!("zed_og: E_OPEN_EXTERNAL"),
++    })
++    .detach();
++}
++
 +fn add_search_bar(
 +    workspace: &Workspace,
 +    pane: &gpui::Entity<workspace::Pane>,
@@ -450,3 +1125,21 @@ index 0000000..991c5ed
 +        });
 +    });
 +}
+diff --git a/crates/zed_og/tests/filter.rs b/crates/zed_og/tests/filter.rs
+new file mode 100644
+index 0000000..52a104b
+--- /dev/null
++++ b/crates/zed_og/tests/filter.rs
+@@ -0,0 +1,3 @@
++//! Host tests of the action filter: the crate itself is Android-only, so its plain module is included here.
++#[path = "../src/filter.rs"]
++mod filter;
+diff --git a/crates/zed_og/tests/pending.rs b/crates/zed_og/tests/pending.rs
+new file mode 100644
+index 0000000..df7852a
+--- /dev/null
++++ b/crates/zed_og/tests/pending.rs
+@@ -0,0 +1,3 @@
++//! Host tests of the queue for shared files that arrive before the first window (the crate is Android-only).
++#[path = "../src/pending.rs"]
++mod pending;

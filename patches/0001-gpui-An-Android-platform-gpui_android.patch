@@ -14,17 +14,19 @@ gpui_wgpu learn the android target.
  crates/gpui_android/examples/android_input.rs | 776 +++++++++++++++++
  crates/gpui_android/src/dispatcher.rs         | 193 +++++
  crates/gpui_android/src/display.rs            |  41 +
- crates/gpui_android/src/gpui_android.rs       |  42 +
- crates/gpui_android/src/ime.rs                | 182 ++++
- crates/gpui_android/src/input.rs              | 496 +++++++++++
+ crates/gpui_android/src/gpui_android.rs       |  61 ++
+ crates/gpui_android/src/ime.rs                | 199 +++++
+ crates/gpui_android/src/input.rs              | 502 +++++++++++
+ crates/gpui_android/src/insets.rs             |  82 ++
  crates/gpui_android/src/logging.rs            |  22 +
- crates/gpui_android/src/platform.rs           | 781 ++++++++++++++++++
- crates/gpui_android/src/window.rs             | 585 +++++++++++++
+ crates/gpui_android/src/platform.rs           | 819 ++++++++++++++++++
+ crates/gpui_android/src/route.rs              |  66 ++
+ crates/gpui_android/src/window.rs             | 598 +++++++++++++
  crates/gpui_platform/Cargo.toml               |   3 +
  crates/gpui_platform/src/gpui_platform.rs     |   8 +
  crates/gpui_wgpu/src/wgpu_context.rs          |  40 +-
- crates/gpui_wgpu/src/wgpu_renderer.rs         |  44 +-
- 16 files changed, 3243 insertions(+), 19 deletions(-)
+ crates/gpui_wgpu/src/wgpu_renderer.rs         | 107 ++-
+ 18 files changed, 3541 insertions(+), 25 deletions(-)
  create mode 100644 crates/gpui_android/Cargo.toml
  create mode 120000 crates/gpui_android/LICENSE-APACHE
  create mode 100644 crates/gpui_android/examples/android_input.rs
@@ -33,8 +35,10 @@ gpui_wgpu learn the android target.
  create mode 100644 crates/gpui_android/src/gpui_android.rs
  create mode 100644 crates/gpui_android/src/ime.rs
  create mode 100644 crates/gpui_android/src/input.rs
+ create mode 100644 crates/gpui_android/src/insets.rs
  create mode 100644 crates/gpui_android/src/logging.rs
  create mode 100644 crates/gpui_android/src/platform.rs
+ create mode 100644 crates/gpui_android/src/route.rs
  create mode 100644 crates/gpui_android/src/window.rs
 
 diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
@@ -1147,30 +1151,48 @@ index 0000000..57b4177
 +}
 diff --git a/crates/gpui_android/src/gpui_android.rs b/crates/gpui_android/src/gpui_android.rs
 new file mode 100644
-index 0000000..f90a9d7
+index 0000000..8ff9979
 --- /dev/null
 +++ b/crates/gpui_android/src/gpui_android.rs
-@@ -0,0 +1,42 @@
-+#![cfg(target_os = "android")]
+@@ -0,0 +1,61 @@
++//! GPUI on Android. Everything but the inset arithmetic (host-tested) is Android-only.
 +
++#[cfg(target_os = "android")]
 +mod dispatcher;
++#[cfg(target_os = "android")]
 +mod display;
++#[cfg(target_os = "android")]
 +mod ime;
++#[cfg(target_os = "android")]
 +mod input;
++mod insets;
++#[cfg(target_os = "android")]
 +mod logging;
++#[cfg(target_os = "android")]
 +mod platform;
++mod route;
++#[cfg(target_os = "android")]
 +mod window;
 +
++#[cfg(target_os = "android")]
 +use std::sync::Mutex;
 +
++#[cfg(target_os = "android")]
 +pub use android_activity::AndroidApp;
++#[cfg(target_os = "android")]
 +pub use display::AndroidDisplay;
++#[cfg(target_os = "android")]
++pub use ime::release_external;
++#[cfg(target_os = "android")]
 +pub use logging::init_logging;
++#[cfg(target_os = "android")]
 +pub use platform::AndroidPlatform;
 +
++#[cfg(target_os = "android")]
 +static ANDROID_APP: Mutex<Option<AndroidApp>> = Mutex::new(None);
 +
 +/// Records the app handed to `android_main`; call it before creating the GPUI application.
++#[cfg(target_os = "android")]
 +pub fn init(app: AndroidApp) {
 +    init_logging();
 +    std::panic::set_hook(Box::new(|info| {
@@ -1186,6 +1208,7 @@ index 0000000..f90a9d7
 +        .unwrap_or_else(|error| error.into_inner()) = Some(app);
 +}
 +
++#[cfg(target_os = "android")]
 +pub fn android_app() -> AndroidApp {
 +    ANDROID_APP
 +        .lock()
@@ -1195,10 +1218,10 @@ index 0000000..f90a9d7
 +}
 diff --git a/crates/gpui_android/src/ime.rs b/crates/gpui_android/src/ime.rs
 new file mode 100644
-index 0000000..96ad1ce
+index 0000000..30b21dd
 --- /dev/null
 +++ b/crates/gpui_android/src/ime.rs
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,199 @@
 +//! Bridge to ai.outgate.zed.ZedActivity: soft-keyboard text from its InputConnection and the system clipboard.
 +//! Java calls the native methods on its UI thread; events are queued here and applied on the android_main thread.
 +
@@ -1223,10 +1246,10 @@ index 0000000..96ad1ce
 +        meta_state: i32,
 +        down: bool,
 +    },
-+    Insets {
-+        bottom: i32,
-+    },
++    Insets(crate::insets::Insets),
 +    Back,
++    /// ZED2 F3: a file another app shared, copied into the app's storage: open it (GPUI's open-urls callback).
++    OpenPath(String),
 +}
 +
 +static QUEUE: Mutex<Vec<ImeEvent>> = Mutex::new(Vec::new());
@@ -1324,14 +1347,22 @@ index 0000000..96ad1ce
 +}
 +
 +#[unsafe(no_mangle)]
++extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeOpenPath<'local>(
++    env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    path: JString<'local>,
++) {
++    push_text(env, path, ImeEvent::OpenPath);
++}
++
++#[unsafe(no_mangle)]
 +extern "system" fn Java_ai_outgate_zed_ZedActivity_nativeInsets<'local>(
 +    _env: EnvUnowned<'local>,
 +    _class: JClass<'local>,
 +    top: i32,
 +    bottom: i32,
 +) {
-+    let _ = top;
-+    push(ImeEvent::Insets { bottom });
++    push(ImeEvent::Insets(crate::insets::Insets::new(top, bottom)));
 +}
 +
 +jni::bind_java_type! {
@@ -1340,6 +1371,7 @@ index 0000000..96ad1ce
 +        fn show_keyboard(show: bool),
 +        fn read_clipboard() -> JString,
 +        fn write_clipboard(text: JString),
++        fn release_external(path: JString),
 +    }
 +}
 +
@@ -1374,6 +1406,14 @@ index 0000000..96ad1ce
 +    .flatten()
 +}
 +
++/// ZED2 F3: the editor for a shared file closed: the activity ends the other app's grant.
++pub fn release_external(path: &str) {
++    with_activity(|env, activity| {
++        let path = JString::from_str(env, path)?;
++        activity.release_external(env, &path)
++    });
++}
++
 +pub(crate) fn write_clipboard(text: &str) -> bool {
 +    with_activity(|env, activity| {
 +        let text = JString::from_str(env, text)?;
@@ -1383,10 +1423,10 @@ index 0000000..96ad1ce
 +}
 diff --git a/crates/gpui_android/src/input.rs b/crates/gpui_android/src/input.rs
 new file mode 100644
-index 0000000..597181f
+index 0000000..d68a1cc
 --- /dev/null
 +++ b/crates/gpui_android/src/input.rs
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,502 @@
 +use std::{
 +    collections::{HashMap, hash_map::Entry},
 +    time::{Duration, Instant},
@@ -1404,6 +1444,8 @@ index 0000000..597181f
 +    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta,
 +    ScrollWheelEvent, TouchPhase, point, px,
 +};
++
++use crate::insets::Insets;
 +
 +const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 +const DOUBLE_CLICK_DISTANCE: f32 = 24.;
@@ -1467,10 +1509,14 @@ index 0000000..597181f
 +        &mut self,
 +        event: &MotionEvent<'_>,
 +        scale_factor: f32,
++        insets: Insets,
 +        modifiers: Modifiers,
 +    ) -> Vec<PlatformInput> {
-+        let to_logical =
-+            |x: f32, y: f32| -> Point<Pixels> { point(px(x / scale_factor), px(y / scale_factor)) };
++        // Positions are on the surface; GPUI's window starts below the top inset (a caption, the status bar).
++        let to_logical = |x: f32, y: f32| -> Point<Pixels> {
++            let (x, y) = insets.logical_point(x, y, scale_factor);
++            point(px(x), px(y))
++        };
 +        let index = event.pointer_index();
 +        let pointer = event.pointer_at_index(index.min(event.pointer_count().saturating_sub(1)));
 +        let position = to_logical(pointer.x(), pointer.y());
@@ -1883,6 +1929,94 @@ index 0000000..597181f
 +        _ => return None,
 +    })
 +}
+diff --git a/crates/gpui_android/src/insets.rs b/crates/gpui_android/src/insets.rs
+new file mode 100644
+index 0000000..743a24e
+--- /dev/null
++++ b/crates/gpui_android/src/insets.rs
+@@ -0,0 +1,82 @@
++//! The strips of the window that something else draws over: the status bar or a desktop window's caption at the top,
++//! the navigation bar or the soft keyboard at the bottom. GPUI lays out in the rest; the scene is drawn from
++//! `top` down and touch positions are moved up by `top`. Plain arithmetic, so it is tested on the host.
++#![cfg_attr(not(target_os = "android"), allow(dead_code))]
++
++/// Covered device pixels at the top and bottom of the window's surface.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Insets {
++    pub(crate) top: i32,
++    pub(crate) bottom: i32,
++}
++
++impl Insets {
++    pub(crate) fn new(top: i32, bottom: i32) -> Self {
++        Self {
++            top: top.max(0),
++            bottom: bottom.max(0),
++        }
++    }
++
++    /// The insets for a surface `device_height` pixels high, never leaving less than one row to lay out in.
++    pub(crate) fn clamped(self, device_height: i32) -> Self {
++        let room = (device_height - 1).max(0);
++        let top = self.top.min(room);
++        Self::new(top, self.bottom.min(room - top))
++    }
++
++    /// Where the scene starts on the surface, in device pixels.
++    pub(crate) fn origin_y(self, device_height: i32) -> u32 {
++        self.clamped(device_height).top as u32
++    }
++
++    /// The device-pixel height GPUI lays out in.
++    pub(crate) fn content_height(self, device_height: i32) -> i32 {
++        let insets = self.clamped(device_height);
++        (device_height - insets.top - insets.bottom).max(1)
++    }
++
++    /// A surface position (a touch, a mouse) in GPUI's logical window coordinates.
++    pub(crate) fn logical_point(self, x: f32, y: f32, scale_factor: f32) -> (f32, f32) {
++        (x / scale_factor, (y - self.top as f32) / scale_factor)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::Insets;
++
++    #[test]
++    fn a_caption_moves_the_scene_down_and_shortens_the_layout() {
++        let insets = Insets::new(84, 0);
++        assert_eq!(insets.origin_y(2000), 84);
++        assert_eq!(insets.content_height(2000), 2000 - 84);
++    }
++
++    #[test]
++    fn top_and_bottom_both_come_off_the_layout() {
++        let insets = Insets::new(100, 300);
++        assert_eq!(insets.content_height(2400), 2000);
++        assert_eq!(insets.origin_y(2400), 100);
++    }
++
++    #[test]
++    fn a_touch_on_the_first_row_lands_on_the_first_row() {
++        // 2.0 density, 84 px caption: a touch 10 px below the caption is 5 logical px into the content.
++        let (x, y) = Insets::new(84, 0).logical_point(40.0, 94.0, 2.0);
++        assert_eq!((x, y), (20.0, 5.0));
++    }
++
++    #[test]
++    fn insets_larger_than_the_surface_leave_one_row() {
++        let insets = Insets::new(900, 900).clamped(1000);
++        assert_eq!(insets.content_height(1000), 1);
++        assert!(insets.origin_y(1000) <= 999);
++        assert_eq!(insets.top + insets.bottom, 999);
++    }
++
++    #[test]
++    fn negative_insets_are_zero() {
++        assert_eq!(Insets::new(-5, -1), Insets::new(0, 0));
++    }
++}
 diff --git a/crates/gpui_android/src/logging.rs b/crates/gpui_android/src/logging.rs
 new file mode 100644
 index 0000000..40bb1e2
@@ -1913,10 +2047,10 @@ index 0000000..40bb1e2
 +}
 diff --git a/crates/gpui_android/src/platform.rs b/crates/gpui_android/src/platform.rs
 new file mode 100644
-index 0000000..59a3f40
+index 0000000..b3ca3ec
 --- /dev/null
 +++ b/crates/gpui_android/src/platform.rs
-@@ -0,0 +1,781 @@
+@@ -0,0 +1,819 @@
 +use std::{
 +    borrow::Cow,
 +    cell::{Cell, RefCell},
@@ -1935,10 +2069,10 @@ index 0000000..59a3f40
 +use futures::channel::oneshot;
 +use gpui::{
 +    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-+    ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
-+    PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-+    PlatformWindow, PriorityQueueReceiver, RunnableVariant, Task, ThermalState, WindowAppearance,
-+    WindowParams,
++    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
++    PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper,
++    PlatformTextSystem, PlatformWindow, PriorityQueueReceiver, RunnableVariant, Task, ThermalState,
++    WindowAppearance, WindowParams,
 +};
 +use gpui_wgpu::{CosmicTextSystem, GpuContext};
 +
@@ -1947,6 +2081,7 @@ index 0000000..59a3f40
 +    display::AndroidDisplay,
 +    ime::ImeEvent,
 +    input::InputState,
++    insets::Insets,
 +    window::{AndroidWindow, WindowInner},
 +};
 +
@@ -2000,7 +2135,9 @@ index 0000000..59a3f40
 +    resumed: Cell<bool>,
 +    force_render: Cell<bool>,
 +    quitting: Cell<bool>,
-+    bottom_inset: Cell<i32>,
++    insets: Cell<Insets>,
++    /// The app's menus, drawn by the app itself (Android has no menu bar).
++    menus: RefCell<Vec<OwnedMenu>>,
 +    keyboard_shown: Cell<bool>,
 +    paste_requested: Cell<bool>,
 +}
@@ -2038,7 +2175,8 @@ index 0000000..59a3f40
 +            resumed: Cell::new(false),
 +            force_render: Cell::new(true),
 +            quitting: Cell::new(false),
-+            bottom_inset: Cell::new(0),
++            insets: Cell::new(Insets::default()),
++            menus: RefCell::new(Vec::new()),
 +            keyboard_shown: Cell::new(false),
 +            paste_requested: Cell::new(false),
 +        }
@@ -2133,6 +2271,7 @@ index 0000000..59a3f40
 +                        pending = self.input.borrow_mut().motion(
 +                            motion,
 +                            window.scale_factor(),
++                            window.insets(),
 +                            window.modifiers(),
 +                        );
 +                        InputStatus::Handled
@@ -2240,16 +2379,43 @@ index 0000000..59a3f40
 +            return false;
 +        }
 +        let window = self.window();
++        // Text and keys before the window exists have nowhere to go; insets and a shared file to open still apply
++        // (ZED2 F3: `zed <file>` starting the app hands the file over before the window is up).
++        let events = crate::route::dispatchable(events, window.is_some(), |event| {
++            crate::route::needs_window(match event {
++                ImeEvent::Commit(_)
++                | ImeEvent::Compose(_)
++                | ImeEvent::FinishComposing
++                | ImeEvent::DeleteSurrounding { .. } => crate::route::EventKind::Text,
++                ImeEvent::Key { .. } => crate::route::EventKind::Key,
++                ImeEvent::Insets(_) => crate::route::EventKind::Insets,
++                ImeEvent::Back => crate::route::EventKind::Back,
++                ImeEvent::OpenPath(_) => crate::route::EventKind::OpenPath,
++            })
++        });
 +        for event in events {
-+            if let ImeEvent::Insets { bottom } = event {
-+                self.bottom_inset.set(bottom);
-+                if let Some(window) = &window {
-+                    window.set_bottom_inset(bottom);
++            match event {
++                ImeEvent::Insets(insets) => {
++                    self.insets.set(insets);
++                    if let Some(window) = &window {
++                        window.set_insets(insets);
++                    }
++                    self.force_render.set(true);
++                    continue;
 +                }
-+                self.force_render.set(true);
-+                continue;
++                ImeEvent::OpenPath(path) => {
++                    let callback = self.callbacks.borrow_mut().open_urls.take();
++                    if let Some(mut callback) = callback {
++                        callback(vec![path]);
++                        self.callbacks
++                            .borrow_mut()
++                            .open_urls
++                            .get_or_insert(callback);
++                    }
++                    continue;
++                }
++                _ => {}
 +            }
-+            // Text and keys before the window exists have nowhere to go.
 +            let Some(window) = &window else {
 +                continue;
 +            };
@@ -2281,7 +2447,7 @@ index 0000000..59a3f40
 +                        }
 +                    });
 +                }
-+                ImeEvent::Insets { .. } => {}
++                ImeEvent::Insets(_) | ImeEvent::OpenPath(_) => {}
 +                ImeEvent::Back => self.handle_back(window),
 +                ImeEvent::Key {
 +                    key_code,
@@ -2535,7 +2701,7 @@ index 0000000..59a3f40
 +            }
 +            Err(error) => return Err(error),
 +        };
-+        inner.set_bottom_inset(self.bottom_inset.get());
++        inner.set_insets(self.insets.get());
 +        match self
 +            .gpu_context
 +            .borrow()
@@ -2602,7 +2768,13 @@ index 0000000..59a3f40
 +        self.callbacks.borrow_mut().reopen = Some(callback);
 +    }
 +
-+    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}
++    fn set_menus(&self, menus: Vec<Menu>, _keymap: &Keymap) {
++        *self.menus.borrow_mut() = menus.into_iter().map(Menu::owned).collect();
++    }
++
++    fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
++        Some(self.menus.borrow().clone())
++    }
 +
 +    fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
 +
@@ -2698,12 +2870,84 @@ index 0000000..59a3f40
 +        "Android"
 +    }
 +}
+diff --git a/crates/gpui_android/src/route.rs b/crates/gpui_android/src/route.rs
+new file mode 100644
+index 0000000..85791f9
+--- /dev/null
++++ b/crates/gpui_android/src/route.rs
+@@ -0,0 +1,66 @@
++//! Which queued IME/JNI events still apply before the native window exists: insets and a shared file to open don't
++//! need a window (ZED2 F3 cold start); text, keys and Back do. Plain logic, so it is tested on the host.
++#![cfg_attr(not(target_os = "android"), allow(dead_code))]
++
++/// The events of `events` to handle now: all of them with a window, else only those for which `needs_window` is false.
++pub(crate) fn dispatchable<T>(
++    events: Vec<T>,
++    has_window: bool,
++    needs_window: impl Fn(&T) -> bool,
++) -> Vec<T> {
++    if has_window {
++        return events;
++    }
++    events.into_iter().filter(|e| !needs_window(e)).collect()
++}
++
++/// What a queued IME/JNI event is, for [needs_window] (ime::ImeEvent is Android-only; platform.rs maps it).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum EventKind {
++    /// Commit, compose, finish composing, delete around the cursor.
++    Text,
++    Key,
++    Insets,
++    Back,
++    OpenPath,
++}
++
++/// Whether an event of `kind` needs the native window: everything but insets and a shared file to open.
++pub(crate) fn needs_window(kind: EventKind) -> bool {
++    !matches!(kind, EventKind::Insets | EventKind::OpenPath)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{EventKind, dispatchable, needs_window};
++
++    #[test]
++    fn with_a_window_everything_is_handled_in_order() {
++        let events = vec![EventKind::Text, EventKind::OpenPath, EventKind::Back];
++        assert_eq!(
++            dispatchable(events.clone(), true, |k| needs_window(*k)),
++            events
++        );
++    }
++
++    /// Review N8: the predicate production uses (platform.rs maps each ImeEvent to its kind).
++    #[test]
++    fn only_insets_and_a_shared_file_go_through_without_a_window() {
++        assert!(!needs_window(EventKind::Insets));
++        assert!(!needs_window(EventKind::OpenPath));
++        for kind in [EventKind::Text, EventKind::Key, EventKind::Back] {
++            assert!(needs_window(kind), "{kind:?}");
++        }
++        let events = vec![
++            EventKind::Text,
++            EventKind::OpenPath,
++            EventKind::Key,
++            EventKind::Insets,
++            EventKind::Back,
++        ];
++        assert_eq!(
++            dispatchable(events, false, |k| needs_window(*k)),
++            vec![EventKind::OpenPath, EventKind::Insets]
++        );
++    }
++}
 diff --git a/crates/gpui_android/src/window.rs b/crates/gpui_android/src/window.rs
 new file mode 100644
-index 0000000..e0c1de0
+index 0000000..08ebfdf
 --- /dev/null
 +++ b/crates/gpui_android/src/window.rs
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,598 @@
 +use std::{
 +    cell::{Cell, RefCell},
 +    rc::Rc,
@@ -2725,7 +2969,7 @@ index 0000000..e0c1de0
 +    RawDisplayHandle, WindowHandle,
 +};
 +
-+use crate::display::AndroidDisplay;
++use crate::{display::AndroidDisplay, insets::Insets};
 +
 +#[derive(Clone, Debug)]
 +pub(crate) struct SurfaceHandle(pub(crate) NativeWindow);
@@ -2765,7 +3009,7 @@ index 0000000..e0c1de0
 +    renderer: WgpuRenderer,
 +    native_window: Option<NativeWindow>,
 +    device_size: Size<DevicePixels>,
-+    bottom_inset: i32,
++    insets: Insets,
 +    scale_factor: f32,
 +    appearance: WindowAppearance,
 +    input_handler: Option<PlatformInputHandler>,
@@ -2824,7 +3068,7 @@ index 0000000..e0c1de0
 +                renderer,
 +                native_window: Some(native_window),
 +                device_size,
-+                bottom_inset: 0,
++                insets: Insets::default(),
 +                scale_factor,
 +                appearance,
 +                input_handler: None,
@@ -2848,25 +3092,31 @@ index 0000000..e0c1de0
 +}
 +
 +impl WindowInner {
-+    /// The part of the surface not covered by the navigation bar or the soft keyboard; GPUI lays out in it and the
-+    /// covered strip at the bottom keeps the cleared background.
++    /// The part of the surface not covered by the status bar or a caption (top) and the navigation bar or the soft
++    /// keyboard (bottom); GPUI lays out in it and the covered strips keep the cleared background.
 +    fn logical_size(state: &State) -> Size<Pixels> {
-+        let height = (state.device_size.height.0 - state.bottom_inset).max(1);
++        let height = state.insets.content_height(state.device_size.height.0);
 +        size(
 +            px(state.device_size.width.0 as f32 / state.scale_factor),
 +            px(height as f32 / state.scale_factor),
 +        )
 +    }
 +
-+    pub(crate) fn set_bottom_inset(&self, bottom: i32) {
++    pub(crate) fn set_insets(&self, insets: Insets) {
 +        {
 +            let mut state = self.state.borrow_mut();
-+            if state.bottom_inset == bottom.max(0) {
++            if state.insets == insets {
 +                return;
 +            }
-+            state.bottom_inset = bottom.max(0);
++            state.insets = insets;
++            let origin = insets.origin_y(state.device_size.height.0);
++            state.renderer.set_content_origin_y(origin);
 +        }
 +        self.notify_resize();
++    }
++
++    pub(crate) fn insets(&self) -> Insets {
++        self.state.borrow().insets
 +    }
 +
 +    pub(crate) fn has_surface(&self) -> bool {
@@ -2895,6 +3145,11 @@ index 0000000..e0c1de0
 +            self.state.borrow_mut().native_window = None;
 +            return;
 +        }
++        {
++            let mut state = self.state.borrow_mut();
++            let origin = state.insets.origin_y(device_size.height.0);
++            state.renderer.set_content_origin_y(origin);
++        }
 +        self.notify_resize();
 +    }
 +
@@ -2916,6 +3171,8 @@ index 0000000..e0c1de0
 +            if device_size != state.device_size {
 +                state.device_size = device_size;
 +                state.renderer.update_drawable_size(device_size);
++                let origin = state.insets.origin_y(device_size.height.0);
++                state.renderer.set_content_origin_y(origin);
 +            }
 +            state.scale_factor = scale_factor;
 +            changed
@@ -3388,7 +3645,7 @@ index 2662a92..8ea8366 100644
          let caps = surface.get_capabilities(&self.adapter);
          if caps.formats.is_empty() {
 diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
-index c38de02..af8e0af 100644
+index c38de02..2a25c74 100644
 --- a/crates/gpui_wgpu/src/wgpu_renderer.rs
 +++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
 @@ -107,7 +107,7 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
@@ -3400,7 +3657,17 @@ index c38de02..af8e0af 100644
      pipelines: WgpuPipelines,
      bind_group_layouts: WgpuBindGroupLayouts,
      atlas_sampler: wgpu::Sampler,
-@@ -437,7 +437,7 @@ impl WgpuRenderer {
+@@ -146,6 +146,9 @@ pub struct WgpuRenderer {
+     failed_frame_count: u32,
+     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+     surface_configured: bool,
++    /// Rows at the top of the surface something else draws over (Android: the status bar, a desktop caption); the
++    /// scene is drawn below them. 0 elsewhere.
++    content_origin_y: u32,
+ }
+ 
+ impl WgpuRenderer {
+@@ -437,7 +440,7 @@ impl WgpuRenderer {
          let resources = WgpuResources {
              device,
              queue,
@@ -3409,7 +3676,53 @@ index c38de02..af8e0af 100644
              pipelines,
              bind_group_layouts,
              atlas_sampler,
-@@ -966,9 +966,9 @@ impl WgpuRenderer {
+@@ -474,6 +477,7 @@ impl WgpuRenderer {
+             failed_frame_count: 0,
+             device_lost: context.device_lost_flag(),
+             surface_configured: true,
++            content_origin_y: 0,
+         })
+     }
+ 
+@@ -928,6 +932,37 @@ impl WgpuRenderer {
+         Some((texture, view))
+     }
+ 
++    /// Draws the scene from row `origin_y` of the surface down; the rows above keep the cleared background.
++    pub fn set_content_origin_y(&mut self, origin_y: u32) {
++        let origin_y = origin_y.min(self.surface_config.height.saturating_sub(1));
++        if origin_y != self.content_origin_y {
++            self.content_origin_y = origin_y;
++            self.invalidate_intermediate_textures();
++        }
++    }
++
++    /// The part of the surface the scene is laid out in: below [`Self::set_content_origin_y`].
++    fn content_size(&self) -> (u32, u32) {
++        (
++            self.surface_config.width,
++            self.surface_config
++                .height
++                .saturating_sub(self.content_origin_y)
++                .max(1),
++        )
++    }
++
++    /// Drops the path textures (recreated at the content size in `draw`); wgpu frees them once in-flight work is done.
++    fn invalidate_intermediate_textures(&mut self) {
++        let Some(resources) = self.resources.as_mut() else {
++            return;
++        };
++        resources.path_intermediate_texture = None;
++        resources.path_intermediate_view = None;
++        resources.path_msaa_texture = None;
++        resources.path_msaa_view = None;
++    }
++
+     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+         let width = size.width.0 as u32;
+         let height = size.height.0 as u32;
+@@ -966,9 +1001,9 @@ impl WgpuRenderer {
                  texture.destroy();
              }
  
@@ -3422,7 +3735,18 @@ index c38de02..af8e0af 100644
  
              // Invalidate intermediate textures - they will be lazily recreated
              // in draw() after we confirm the surface is healthy. This avoids
-@@ -1021,9 +1021,9 @@ impl WgpuRenderer {
+@@ -986,8 +1021,8 @@ impl WgpuRenderer {
+         }
+ 
+         let format = self.surface_config.format;
+-        let width = self.surface_config.width;
+-        let height = self.surface_config.height;
++        // The path intermediate covers the content only: vs_path samples it at the position over the viewport size.
++        let (width, height) = self.content_size();
+         let path_sample_count = self.rendering_params.path_sample_count;
+         let resources = self.resources_mut();
+ 
+@@ -1021,9 +1056,9 @@ impl WgpuRenderer {
              let path_sample_count = self.rendering_params.path_sample_count;
              let dual_source_blending = self.dual_source_blending;
              let resources = self.resources_mut();
@@ -3435,7 +3759,7 @@ index c38de02..af8e0af 100644
              resources.pipelines = Self::create_pipelines(
                  &resources.device,
                  &resources.bind_group_layouts,
-@@ -1089,24 +1089,27 @@ impl WgpuRenderer {
+@@ -1089,24 +1124,27 @@ impl WgpuRenderer {
  
          self.atlas.before_frame();
  
@@ -3470,7 +3794,60 @@ index c38de02..af8e0af 100644
                  return;
              }
              wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-@@ -1675,6 +1678,15 @@ impl WgpuRenderer {
+@@ -1133,11 +1171,9 @@ impl WgpuRenderer {
+             _pad: [0.0; 2],
+         };
+ 
++        let (content_width, content_height) = self.content_size();
+         let globals = GlobalParams {
+-            viewport_size: [
+-                self.surface_config.width as f32,
+-                self.surface_config.height as f32,
+-            ],
++            viewport_size: [content_width as f32, content_height as f32],
+             premultiplied_alpha: if self.surface_config.alpha_mode
+                 == wgpu::CompositeAlphaMode::PreMultiplied
+             {
+@@ -1198,6 +1234,7 @@ impl WgpuRenderer {
+                     depth_stencil_attachment: None,
+                     ..Default::default()
+                 });
++                self.set_content_viewport(&mut pass);
+ 
+                 for batch in scene.batches() {
+                     let ok = match batch {
+@@ -1237,6 +1274,7 @@ impl WgpuRenderer {
+                                 depth_stencil_attachment: None,
+                                 ..Default::default()
+                             });
++                            self.set_content_viewport(&mut pass);
+ 
+                             if did_draw {
+                                 self.draw_paths_from_intermediate(
+@@ -1309,6 +1347,22 @@ impl WgpuRenderer {
+         }
+     }
+ 
++    /// Maps the scene (laid out in [`Self::content_size`]) to the surface below the content origin.
++    fn set_content_viewport(&self, pass: &mut wgpu::RenderPass<'_>) {
++        if self.content_origin_y == 0 {
++            return;
++        }
++        let (width, height) = self.content_size();
++        pass.set_viewport(
++            0.0,
++            self.content_origin_y as f32,
++            width as f32,
++            height as f32,
++            0.0,
++            1.0,
++        );
++    }
++
+     fn draw_quads(
+         &self,
+         quads: &[Quad],
+@@ -1675,6 +1729,15 @@ impl WgpuRenderer {
          }
      }
  
@@ -3486,7 +3863,7 @@ index c38de02..af8e0af 100644
      /// Replace the wgpu surface with a new one (e.g. after Android destroys
      /// and recreates the native window).  Keeps the device, queue, atlas, and
      /// all pipelines intact so cached `AtlasTextureId`s remain valid.
-@@ -1718,7 +1730,7 @@ impl WgpuRenderer {
+@@ -1718,7 +1781,7 @@ impl WgpuRenderer {
                  .as_mut()
                  .expect("GPU resources not available");
              surface.configure(&res.device, &self.surface_config);

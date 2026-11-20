@@ -8,15 +8,21 @@ ZedActivity (the NativeActivity with the soft-keyboard bridge, clipboard, insets
 Back), the app manifest and launcher icon, the cross-compile environment for the NDK,
 and notices.py, which lists the licences of the crates linked into the library.
 ---
- og-os/docker/og-zed-env.sh                    |  11 ++
- og-os/java/ai/outgate/zed/ZedActivity.java    | 154 ++++++++++++++++++
- og-os/tools/notices.py                        | 138 ++++++++++++++++
- og-os/zed-apk/AndroidManifest.xml             |  29 ++++
+ og-os/docker/og-zed-env.sh                    |  11 +
+ og-os/java/ai/outgate/zed/ExternalCopies.java | 156 ++++++
+ og-os/java/ai/outgate/zed/ExternalFile.java   | 106 +++++
+ og-os/java/ai/outgate/zed/WriteBack.java      |  49 ++
+ og-os/java/ai/outgate/zed/ZedActivity.java    | 447 ++++++++++++++++++
+ og-os/tools/notices.py                        | 138 ++++++
+ og-os/zed-apk/AndroidManifest.xml             |  38 ++
  og-os/zed-apk/res/drawable/zed_icon.xml       |   8 +
- .../res/drawable/zed_icon_background.xml      |  19 +++
- .../res/drawable/zed_icon_foreground.xml      |  14 ++
- 7 files changed, 373 insertions(+)
+ .../res/drawable/zed_icon_background.xml      |  19 +
+ .../res/drawable/zed_icon_foreground.xml      |  14 +
+ 10 files changed, 986 insertions(+)
  create mode 100644 og-os/docker/og-zed-env.sh
+ create mode 100644 og-os/java/ai/outgate/zed/ExternalCopies.java
+ create mode 100644 og-os/java/ai/outgate/zed/ExternalFile.java
+ create mode 100644 og-os/java/ai/outgate/zed/WriteBack.java
  create mode 100644 og-os/java/ai/outgate/zed/ZedActivity.java
  create mode 100644 og-os/tools/notices.py
  create mode 100644 og-os/zed-apk/AndroidManifest.xml
@@ -41,19 +47,354 @@ index 0000000..3d80227
 +    export "CARGO_TARGET_${u}_LINKER=$ndk_bin/${t}34-clang"
 +done
 +unset ndk_bin t u l
+diff --git a/og-os/java/ai/outgate/zed/ExternalCopies.java b/og-os/java/ai/outgate/zed/ExternalCopies.java
+new file mode 100644
+index 0000000..727f76c
+--- /dev/null
++++ b/og-os/java/ai/outgate/zed/ExternalCopies.java
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: Apache-2.0
++package ai.outgate.zed;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.FileAlreadyExistsException;
++import java.nio.file.Files;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++/**
++ * ZED2 F3 (review B2/R1/R4/R7/R2/L6): Zed's copy of a file another app shared may be the user's only copy of edits
++ * Terminal didn't take. It is deleted only on proof: a saved record (beside its token directory, so it survives Zed's
++ * process) naming the copy's mtime and size as they were when Terminal took them, and no unsaved mark. Anything else
++ * moves to the project's "Unsaved from Terminal" folder when its tab closes. A copy that already exists is the working
++ * copy and is never imported over. Plain Java, host-tested.
++ */
++final class ExternalCopies {
++    static final String TOAST_NOT_SAVED = "Couldn't save to Terminal; your copy is kept";
++    static final String KEPT_DIR = "Unsaved from Terminal";
++    static final String TERMINAL_FILES = "ai.outgate.terminal.zed";
++    private static final String TOKEN = "[0-9a-f]{32}";
++
++    private ExternalCopies() {}
++
++    /** Review L5: a share URI from OG Terminal's provider: content://<its authority>/<32-hex token>/<a plain name>. */
++    static boolean fromTerminal(String scheme, String authority, String token, String name) {
++        return "content".equals(scheme) && TERMINAL_FILES.equals(authority)
++                && token != null && token.matches(TOKEN)
++                && name != null && name.matches("[^/\\u0000]{1,255}") && !name.equals(".") && !name.equals("..");
++    }
++
++    private static File sibling(File copy, String suffix) {
++        File dir = copy.getParentFile();
++        return new File(dir.getParentFile(), dir.getName() + suffix);
++    }
++
++    /** Terminal took the copy's bytes as they were at [mtime]/[size] (read before the write began). */
++    static void recordSaved(File copy, long mtime, long size) {
++        File record = sibling(copy, ".saved");
++        File tmp = sibling(copy, ".saved.tmp");
++        try {
++            Files.write(tmp.toPath(), (mtime + " " + size).getBytes(StandardCharsets.UTF_8));
++            if (!tmp.renameTo(record)) {
++                tmp.delete();
++                return;
++            }
++        } catch (IOException e) {
++            tmp.delete();
++            return;
++        }
++        sibling(copy, ".unsaved").delete();
++    }
++
++    /** A write-back failed: the copy holds bytes Terminal doesn't. */
++    static void markUnsaved(File copy) {
++        sibling(copy, ".saved").delete();
++        try {
++            sibling(copy, ".unsaved").createNewFile();
++        } catch (IOException e) {
++            // No proof is left either way (the record is gone), so the copy is kept on release.
++        }
++    }
++
++    /** True only when the saved record matches the copy as it is now and nothing marks it unsaved. */
++    static boolean provenSaved(File copy) {
++        if (sibling(copy, ".unsaved").exists() || !copy.isFile()) {
++            return false;
++        }
++        try {
++            String[] r = new String(Files.readAllBytes(sibling(copy, ".saved").toPath()), StandardCharsets.UTF_8)
++                    .trim().split(" ");
++            return r.length == 2 && Long.parseLong(r[0]) == copy.lastModified() && Long.parseLong(r[1]) == copy.length();
++        } catch (IOException | NumberFormatException e) {
++            return false;
++        }
++    }
++
++    /** True when [copy] must be filled from the source: there's no working copy yet. */
++    static boolean needsImport(File copy) {
++        return !copy.exists();
++    }
++
++    /**
++     * The copy's tab closed. A copy proven saved (and not [keep]) is deleted: null. Any other moves to
++     * [project]/[KEPT_DIR] under a name no earlier kept copy has, and that file is returned; if it can't be moved it
++     * stays where it is and [copy] itself is returned.
++     */
++    static File release(File copy, File project, long now, boolean keep) {
++        File dir = copy.getParentFile();
++        if (!keep && provenSaved(copy)) {
++            copy.delete();
++            dir.delete();
++            forget(copy);
++            return null;
++        }
++        File keptDir = new File(project, KEPT_DIR);
++        keptDir.mkdirs();
++        // Re-check 2 S4: every mover is in this process; one at a time, so a free name stays free until it is used.
++        synchronized (ExternalCopies.class) {
++            return moveKept(copy, dir, keptDir, now);
++        }
++    }
++
++    private static File moveKept(File copy, File dir, File keptDir, long now) {
++        for (int i = 0; i < 100; i++) {
++            String name = i == 0 ? copy.getName() : i == 1 ? copy.getName() + "." + now : copy.getName() + "." + now + "-" + i;
++            File kept = new File(keptDir, name);
++            if (kept.exists()) {
++                continue;
++            }
++            try {
++                Files.move(copy.toPath(), kept.toPath());
++            } catch (FileAlreadyExistsException e) {
++                continue;
++            } catch (IOException e) {
++                return copy;
++            }
++            dir.delete();
++            forget(copy);
++            return kept;
++        }
++        return copy;
++    }
++
++    private static void forget(File copy) {
++        sibling(copy, ".saved").delete();
++        sibling(copy, ".unsaved").delete();
++    }
++
++    /**
++     * Review R2: the copies under [external] Zed starts with that the launch request ([keepToken], may be null)
++     * doesn't re-attach. Nothing links them to Terminal any more, so they are kept or deleted like a closed tab.
++     */
++    static List<File> orphans(File external, String keepToken) {
++        List<File> out = new ArrayList<>();
++        File[] dirs = external.listFiles();
++        if (dirs == null) {
++            return out;
++        }
++        Arrays.sort(dirs);
++        for (File dir : dirs) {
++            if (!dir.isDirectory() || !dir.getName().matches(TOKEN) || dir.getName().equals(keepToken)) {
++                continue;
++            }
++            File[] copies = dir.listFiles(File::isFile);
++            if (copies != null) {
++                Arrays.sort(copies);
++                out.addAll(Arrays.asList(copies));
++            }
++        }
++        return out;
++    }
++}
+diff --git a/og-os/java/ai/outgate/zed/ExternalFile.java b/og-os/java/ai/outgate/zed/ExternalFile.java
+new file mode 100644
+index 0000000..17110ef
+--- /dev/null
++++ b/og-os/java/ai/outgate/zed/ExternalFile.java
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: Apache-2.0
++package ai.outgate.zed;
++
++import java.io.File;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.RejectedExecutionException;
++
++/**
++ * ZED2 F3 (review R1): one shared file's copy and its way back to Terminal. Its write-backs and its release run on one
++ * serial thread, so a tab closed while a save is still going to Terminal waits for it. The release writes once more if
++ * the copy changed since its last good write-back (a save whose CLOSE_WRITE was lost), tells Terminal only after
++ * that, and deletes the copy only on proof that Terminal has its bytes; anything else is kept (ExternalCopies).
++ * Plain Java, host-tested.
++ */
++final class ExternalFile {
++    /** The other side: write the copy's bytes back (true when taken), and end the grant. */
++    interface Terminal {
++        boolean write(File copy);
++
++        void release();
++    }
++
++    final File copy;
++    private final Terminal terminal;
++    private final ExecutorService serial = Executors.newSingleThreadExecutor(r -> new Thread(r, "zed-external"));
++    /** In memory next to the on-disk mark (review R4): a failed write-back keeps the copy even if the mark failed. */
++    private volatile boolean unsaved;
++    /** Set on the serial thread when the release starts (re-check 2 S7): later write-backs do nothing. */
++    private volatile boolean released;
++
++    ExternalFile(File copy, Terminal terminal) {
++        this.copy = copy;
++        this.terminal = terminal;
++    }
++
++    /** The copy was just filled from the source: it is what Terminal has. */
++    void imported() {
++        ExternalCopies.recordSaved(copy, copy.lastModified(), copy.length());
++    }
++
++    boolean unsaved() {
++        return unsaved;
++    }
++
++    /** The copy was saved in Zed: write it back to Terminal, in order with the other write-backs and the release. */
++    synchronized Future<Boolean> writeBack() {
++        try {
++            return serial.submit(() -> !released && write());
++        } catch (RejectedExecutionException e) {
++            return CompletableFuture.completedFuture(false);
++        }
++    }
++
++    private boolean write() {
++        long mtime = copy.lastModified();
++        long size = copy.length();
++        boolean ok = terminal.write(copy);
++        if (ok) {
++            unsaved = false;
++            ExternalCopies.recordSaved(copy, mtime, size);
++        } else {
++            unsaved = true;
++            ExternalCopies.markUnsaved(copy);
++        }
++        return ok;
++    }
++
++    /**
++     * The tab closed: after any pending write-back, write once more unless the copy is proven saved, end the grant,
++     * then delete the copy (null) or keep it (the kept file, or [copy] if it couldn't be moved).
++     */
++    synchronized Future<File> release(File project, long now) {
++        Future<File> done = serial.submit(() -> {
++            released = true;
++            if (unsaved || !ExternalCopies.provenSaved(copy)) {
++                write();
++            }
++            terminal.release();
++            return ExternalCopies.release(copy, project, now, unsaved);
++        });
++        serial.shutdown();
++        return done;
++    }
++
++    /**
++     * Re-check 2 S1/S2: waits up to [ms] for this copy's queued write-backs and release (Zed's process exits right
++     * after onDestroy). True when nothing is left pending.
++     */
++    boolean drain(long ms) {
++        try {
++            serial.submit(() -> { }).get(ms, java.util.concurrent.TimeUnit.MILLISECONDS);
++            return true;
++        } catch (RejectedExecutionException e) {
++            try {
++                return serial.awaitTermination(ms, java.util.concurrent.TimeUnit.MILLISECONDS);
++            } catch (InterruptedException ie) {
++                return false;
++            }
++        } catch (Exception e) {
++            return false;
++        }
++    }
++}
+diff --git a/og-os/java/ai/outgate/zed/WriteBack.java b/og-os/java/ai/outgate/zed/WriteBack.java
+new file mode 100644
+index 0000000..31bbd55
+--- /dev/null
++++ b/og-os/java/ai/outgate/zed/WriteBack.java
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: Apache-2.0
++package ai.outgate.zed;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++
++/**
++ * ZED2 F3 (re-check 3 T1): sends a copy's bytes to Terminal through a file descriptor it commits on close. A clean
++ * close only follows a full transfer; any failure closes it with an error, so Terminal drops the half-written file
++ * and the source stays as it was. Plain Java, host-tested.
++ */
++final class WriteBack {
++    /** Terminal's side of one write: the stream, and the two ways to close it (ParcelFileDescriptor's). */
++    interface Channel {
++        OutputStream out() throws IOException;
++
++        void close() throws IOException;
++
++        void closeWithError(String message) throws IOException;
++    }
++
++    private WriteBack() {}
++
++    /** True only when every byte went out and the channel closed cleanly. */
++    static boolean send(File copy, Channel channel) {
++        try (InputStream in = new FileInputStream(copy)) {
++            OutputStream out = channel.out();
++            in.transferTo(out);
++            out.flush();
++        } catch (Throwable e) {
++            // Any failure, an Error too (re-check 4 N4): Terminal must see an error close, never a clean one.
++            try {
++                channel.closeWithError("write");
++            } catch (IOException ignored) {
++                // Closing with an error is all that's left; Terminal sees a dead peer either way.
++            }
++            return false;
++        }
++        try {
++            channel.close();
++            return true;
++        } catch (IOException e) {
++            return false;
++        }
++    }
++}
 diff --git a/og-os/java/ai/outgate/zed/ZedActivity.java b/og-os/java/ai/outgate/zed/ZedActivity.java
 new file mode 100644
-index 0000000..a5613e3
+index 0000000..607d8eb
 --- /dev/null
 +++ b/og-os/java/ai/outgate/zed/ZedActivity.java
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,447 @@
 +package ai.outgate.zed;
 +
 +import android.app.NativeActivity;
 +import android.content.ClipData;
 +import android.content.ClipboardManager;
 +import android.content.Context;
++import android.content.Intent;
++import android.net.Uri;
 +import android.os.Bundle;
++import android.os.FileObserver;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.ParcelFileDescriptor;
 +import android.text.InputType;
 +import android.view.KeyEvent;
 +import android.view.View;
@@ -64,6 +405,13 @@ index 0000000..a5613e3
 +import android.view.inputmethod.InputConnection;
 +import android.view.inputmethod.InputMethodManager;
 +import android.window.OnBackInvokedDispatcher;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.util.HashMap;
++import java.util.Map;
 +
 +/**
 + * NativeActivity with the pieces Rust cannot reach through the NDK: an InputConnection for the soft keyboard
@@ -79,6 +427,7 @@ index 0000000..a5613e3
 +    static native void nativeKey(int keyCode, int metaState, boolean down);
 +    static native void nativeInsets(int top, int bottom);
 +    static native void nativeBack();
++    static native void nativeOpenPath(String path);
 +
 +    static {
 +        // NativeActivity opens the library itself, outside the class loader, so its JNI methods would not be found;
@@ -95,14 +444,293 @@ index 0000000..a5613e3
 +        // native input queue, so hand it to Rust here (the keyboard's own callback still dismisses the IME first).
 +        getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
 +                OnBackInvokedDispatcher.PRIORITY_DEFAULT, ZedActivity::nativeBack);
-+        // Edge to edge (targetSdk 35): the navigation bar and the soft keyboard draw over the native surface, so
-+        // tell the native side how much of the bottom they cover.
++        // Edge to edge (targetSdk 35): the status bar or a desktop window's caption (systemBars includes captionBar)
++        // and the navigation bar or the soft keyboard draw over the native surface, so tell the native side how much
++        // of the top and the bottom they cover.
++        sweepOrphans(getIntent());
++        openFromIntent(getIntent());
++        main.postDelayed(keepGrants, KEEP_EVERY_MS);
 +        getWindow().getDecorView().setOnApplyWindowInsetsListener((view, insets) -> {
 +            android.graphics.Insets covered =
 +                    insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.ime());
 +            nativeInsets(covered.top, covered.bottom);
 +            return view.onApplyWindowInsets(insets);
 +        });
++    }
++
++    @Override
++    protected void onDestroy() {
++        main.removeCallbacks(keepGrants);
++        // Re-check 2 S1/S2: Zed's process exits right after Destroy reaches the native side (in super.onDestroy), so
++        // give pending write-backs and releases up to 2 s to finish first; anything left is recovered at next start.
++        long until = System.currentTimeMillis() + 2_000L;
++        for (ExternalFile f : files) {
++            f.drain(Math.max(1L, until - System.currentTimeMillis()));
++        }
++        super.onDestroy();
++    }
++
++    @Override
++    protected void onNewIntent(Intent intent) {
++        super.onNewIntent(intent);
++        openFromIntent(intent);
++    }
++
++    // ZED2 F3: a file another app (OG Terminal's `zed <file>`) shares through a content URI with a read+write grant.
++    // It is copied into files/projects/external/<token>/<name> and opened in the running window; each save of the copy
++    // is written back through the URI. The other app decides: an unchanged source is overwritten, a changed one keeps
++    // its contents and gets Zed's version beside it (status "changed:<name>"). Closing the file in Zed releases the
++    // grant. A save Terminal can't take keeps the copy (toast; moved to the project's "Unsaved from Terminal" folder
++    // when its tab closes), and Zed keeps the grants of open files alive (review B2). Nothing about the file is logged
++    // (F10).
++    private static final String TERMINAL_FILES = ExternalCopies.TERMINAL_FILES;
++    /** Inside Terminal's ZedShare.KEEP_EVERY_MS: Zed refreshes the grants of the files it has open. */
++    private static final long KEEP_EVERY_MS = 15 * 60_000L;
++    private final Runnable keepGrants = new Runnable() {
++        @Override
++        public void run() {
++            for (External ext : externals.values()) {
++                final String token = ext.uri.getPathSegments().get(0);
++                new Thread(() -> providerCall("keep", token), "zed-keep").start();
++            }
++            main.postDelayed(this, KEEP_EVERY_MS);
++        }
++    };
++    private final Map<String, External> externals = new HashMap<>();
++    /** Every ExternalFile this activity started (open, closing or swept), for the bounded drain in onDestroy. */
++    private final java.util.List<ExternalFile> files = new java.util.concurrent.CopyOnWriteArrayList<>();
++    private final Handler main = new Handler(Looper.getMainLooper());
++
++    private static final class External {
++        final Uri uri;
++        final File copy;
++        /** Its write-backs and its release, in order on one thread (review R1). */
++        final ExternalFile file;
++        FileObserver watch;
++
++        External(Uri uri, File copy, ExternalFile file) {
++            this.uri = uri;
++            this.copy = copy;
++            this.file = file;
++        }
++    }
++
++    private void openFromIntent(Intent intent) {
++        if (intent == null) {
++            return;
++        }
++        String action = intent.getAction();
++        Uri uri = intent.getData();
++        if (uri == null || !("content".equals(uri.getScheme()))
++                || !(Intent.ACTION_EDIT.equals(action) || Intent.ACTION_VIEW.equals(action))) {
++            return;
++        }
++        final boolean writable = Intent.ACTION_EDIT.equals(action)
++                && (intent.getFlags() & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0;
++        new Thread(() -> importExternal(uri, writable), "zed-external").start();
++    }
++
++    private void importExternal(Uri uri, boolean writable) {
++        String token = uri.getPathSegments().size() >= 2 ? uri.getPathSegments().get(0) : null;
++        String name = uri.getLastPathSegment();
++        if (!ExternalCopies.fromTerminal(uri.getScheme(), uri.getAuthority(), token, name)) {
++            return;
++        }
++        File dir = new File(new File(getFilesDir(), "projects/external"), token);
++        File copy = new File(dir, name);
++        // A second request for a file still shared carries the same token: focus the open copy, don't copy again
++        // (that would overwrite what Zed saved and fire a write-back).
++        final String key = copy.getAbsolutePath();
++        boolean[] held = {false};
++        try {
++            java.util.concurrent.FutureTask<Boolean> q = new java.util.concurrent.FutureTask<>(() -> externals.containsKey(key));
++            main.post(q);
++            held[0] = q.get();
++        } catch (Exception e) {
++            return;
++        }
++        if (held[0]) {
++            main.post(() -> nativeOpenPath(key));
++            return;
++        }
++        if (!dir.isDirectory() && !dir.mkdirs()) {
++            return;
++        }
++        // Review L6: a recreated or restarted Zed finds its working copy (possibly with edits Terminal hasn't taken)
++        // and attaches to it; the source is copied only when there is no working copy yet.
++        final ExternalFile file = new ExternalFile(copy, terminalFor(uri, token));
++        files.add(file);
++        if (ExternalCopies.needsImport(copy)) {
++            try (InputStream in = getContentResolver().openInputStream(uri);
++                    OutputStream out = new FileOutputStream(copy)) {
++                if (in == null) {
++                    return;
++                }
++                in.transferTo(out);
++            } catch (Exception e) {
++                copy.delete();
++                return;
++            }
++            file.imported();
++        }
++        final External ext = new External(uri, copy, file);
++        if (writable) {
++            // A buffer save rewrites in place (CLOSE_WRITE); an atomic write lands as a rename (MOVED_TO).
++            ext.watch = new FileObserver(dir, FileObserver.CLOSE_WRITE | FileObserver.MOVED_TO) {
++                @Override
++                public void onEvent(int event, String path) {
++                    if (name.equals(path)) {
++                        ext.file.writeBack();
++                    }
++                }
++            };
++            ext.watch.startWatching();
++        }
++        main.post(() -> {
++            External old = externals.put(copy.getAbsolutePath(), ext);
++            if (old != null && old.watch != null) {
++                old.watch.stopWatching();
++            }
++            nativeOpenPath(copy.getAbsolutePath());
++        });
++    }
++
++    /** How a copy's bytes go back to Terminal (on its ExternalFile's thread) and how its grant ends. */
++    private ExternalFile.Terminal terminalFor(Uri uri, String token) {
++        return new ExternalFile.Terminal() {
++            @Override
++            public boolean write(File copy) {
++                // Re-check 3 T1: through the descriptor Terminal commits on close; a failure closes it with an error
++                // so Terminal drops the half-written file instead of committing it.
++                boolean written;
++                try {
++                    final ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "wt");
++                    if (pfd == null) {
++                        written = false;
++                    } else {
++                        final FileOutputStream out = new FileOutputStream(pfd.getFileDescriptor());
++                        written = WriteBack.send(copy, new WriteBack.Channel() {
++                            @Override
++                            public OutputStream out() {
++                                return out;
++                            }
++
++                            @Override
++                            public void close() throws java.io.IOException {
++                                pfd.close();
++                            }
++
++                            @Override
++                            public void closeWithError(String message) throws java.io.IOException {
++                                pfd.closeWithError(message);
++                            }
++                        });
++                    }
++                } catch (Exception e) {
++                    written = false;
++                }
++                if (!written) {
++                    // Review B2: never silent; the copy is now the only place these edits live.
++                    main.post(() -> android.widget.Toast.makeText(ZedActivity.this, ExternalCopies.TOAST_NOT_SAVED,
++                            android.widget.Toast.LENGTH_LONG).show());
++                    return false;
++                }
++                // Re-check 2 S1: Terminal commits the bytes when the file is closed; only its "ok" (or a side file) counts.
++                String result = providerCall("status", token);
++                if (result == null || !(result.equals("ok") || result.startsWith("changed:"))) {
++                    main.post(() -> android.widget.Toast.makeText(ZedActivity.this, ExternalCopies.TOAST_NOT_SAVED,
++                            android.widget.Toast.LENGTH_LONG).show());
++                    return false;
++                }
++                if (result.startsWith("changed:")) {
++                    main.post(() -> android.widget.Toast.makeText(ZedActivity.this,
++                            "The file changed in Terminal meanwhile: your version was saved beside it as "
++                                    + result.substring("changed:".length()), android.widget.Toast.LENGTH_LONG).show());
++                }
++                return true;
++            }
++
++            @Override
++            public void release() {
++                providerCall("release", token);
++            }
++        };
++    }
++
++    private String providerCall(String method, String token) {
++        try {
++            Bundle b = getContentResolver().call(TERMINAL_FILES, method, token, null);
++            return b == null ? null : b.getString("result");
++        } catch (Exception e) {
++            return null;
++        }
++    }
++
++    /** Called from Rust when the editor for an external file closes: ends the other app's grant. */
++    public void releaseExternal(final String path) {
++        main.post(() -> {
++            External ext = externals.remove(path);
++            if (ext == null) {
++                return;
++            }
++            if (ext.watch != null) {
++                ext.watch.stopWatching();
++            }
++            // Review R1: the release waits for this copy's write-backs, writes once more if a save was missed, and
++            // deletes the copy only on proof that Terminal has its bytes.
++            final java.util.concurrent.Future<File> done =
++                    ext.file.release(projectDir(), System.currentTimeMillis());
++            new Thread(() -> {
++                try {
++                    toastKept(done.get(), ext.copy);
++                } catch (Exception e) {
++                    toastKept(ext.copy, ext.copy);
++                }
++                files.remove(ext.file);
++            }, "zed-release").start();
++        });
++    }
++
++    private File projectDir() {
++        return new File(getFilesDir(), "projects/sample");
++    }
++
++    /** [kept] is null when the copy was saved and deleted; [copy] itself when it couldn't be moved (review R7). */
++    private void toastKept(File kept, File copy) {
++        if (kept == null) {
++            return;
++        }
++        final String text = kept.equals(copy)
++                ? "Couldn't save to Terminal; your copy stays in Zed's storage"
++                : "Your unsaved copy is in \"" + ExternalCopies.KEPT_DIR + "\"";
++        main.post(() -> android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_LONG).show());
++    }
++
++    /**
++     * Review R2: copies Zed starts with that this launch doesn't re-attach (a tab restored from Zed's session, a file
++     * shared before Zed's process died) aren't linked to Terminal any more: each is retried once and then kept or
++     * deleted like a closed tab, and its grant ended.
++     */
++    private void sweepOrphans(Intent launch) {
++        Uri uri = launch == null ? null : launch.getData();
++        String keep = uri != null && uri.getPathSegments().size() >= 2 ? uri.getPathSegments().get(0) : null;
++        File external = new File(getFilesDir(), "projects/external");
++        for (File copy : ExternalCopies.orphans(external, keep)) {
++            String token = copy.getParentFile().getName();
++            Uri orphan = new Uri.Builder().scheme("content").authority(TERMINAL_FILES)
++                    .appendPath(token).appendPath(copy.getName()).build();
++            ExternalFile file = new ExternalFile(copy, terminalFor(orphan, token));
++            files.add(file);
++            final java.util.concurrent.Future<File> done = file.release(projectDir(), System.currentTimeMillis());
++            new Thread(() -> {
++                try {
++                    toastKept(done.get(), copy);
++                } catch (Exception e) {
++                    toastKept(copy, copy);
++                }
++                files.remove(file);
++            }, "zed-orphan").start();
++        }
 +    }
 +
 +    /** Called from Rust (any thread). */
@@ -347,10 +975,10 @@ index 0000000..7442f67
 +    print("unresolved:", ", ".join(missing[:20]))
 diff --git a/og-os/zed-apk/AndroidManifest.xml b/og-os/zed-apk/AndroidManifest.xml
 new file mode 100644
-index 0000000..6037462
+index 0000000..b30ced5
 --- /dev/null
 +++ b/og-os/zed-apk/AndroidManifest.xml
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,38 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<manifest xmlns:android="http://schemas.android.com/apk/res/android"
 +    package="ai.outgate.zed"
@@ -369,6 +997,7 @@ index 0000000..6037462
 +        <activity
 +            android:name="ai.outgate.zed.ZedActivity"
 +            android:exported="true"
++            android:launchMode="singleTask"
 +            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 +            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|density|layoutDirection|colorMode|grammaticalGender|fontWeightAdjustment"
 +            android:windowSoftInputMode="adjustResize">
@@ -376,6 +1005,14 @@ index 0000000..6037462
 +            <intent-filter>
 +                <action android:name="android.intent.action.MAIN" />
 +                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++            <!-- ZED2 F3: open a text file OG Terminal shares by content URI (`zed <file>`). Only its provider's
++                 authority (review L5): other apps' "Open with" doesn't offer Zed for files it would ignore. -->
++            <intent-filter>
++                <action android:name="android.intent.action.EDIT" />
++                <action android:name="android.intent.action.VIEW" />
++                <category android:name="android.intent.category.DEFAULT" />
++                <data android:scheme="content" android:host="ai.outgate.terminal.zed" android:mimeType="text/*" />
 +            </intent-filter>
 +        </activity>
 +    </application>

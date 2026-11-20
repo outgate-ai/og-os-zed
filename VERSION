@@ -1,9 +1,9 @@
-release        unreleased (tag og-os-unreleased of og-os-zed when released)
+release        2026102640 (tag og-os-2026102640 of og-os-zed when released)
 upstream       Zed v0.233.10, commit 350f33871e84d5ed83a403523e9490b9bf014a94, tree a2c0a7964e212f11ed6e8198e51b739ce7f48c76
                tarball sha256 e540560744ed8b3142781accaefe43d808e17c9b614cd3ece6babbb12f62f450
 patches        5, sha256 of the series (cat patches/*.patch):
-               4dbabefb2fc097d644c192b60c0da6074ddb9c9db6ddc7d1e277b7565a35cd20
-Cargo.lock     sha256 24561a90541eb5e73c2d20c571353ff0f418b702b549fbce5271394023a17c6a
+               34977140158c20b60d61676fba16769191b1e0ba1ab0a6ee34c744603a7227c4
+Cargo.lock     sha256 ce3327d01d7ea3e9916d8ee94ad952f33c0d2c169e7f40373b2ade5affb71bc1
 toolchain      Rust 1.94.1, NDK r30, base docker.io/library/ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac, apt snapshot 20261117T000000Z
 build          cargo build --locked -p zed_og --profile og-poc --target <aarch64|x86_64>-linux-android,
                SOURCE_DATE_EPOCH=1777066892, in build/zed.sh's sandbox

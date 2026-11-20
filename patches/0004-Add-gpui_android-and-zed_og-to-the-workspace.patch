@@ -5,12 +5,12 @@ Subject: [PATCH 4/5] Add gpui_android and zed_og to the workspace
 
 The two members and the locked dependencies of the Android targets.
 ---
- Cargo.lock | 178 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ Cargo.lock | 182 +++++++++++++++++++++++++++++++++++++++++++++++++++--
  Cargo.toml |  19 +++++-
- 2 files changed, 190 insertions(+), 7 deletions(-)
+ 2 files changed, 194 insertions(+), 7 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 58ad54e..abcf5d4 100644
+index 58ad54e..2d1576b 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -558,6 +558,48 @@ dependencies = [
@@ -232,7 +232,7 @@ index 58ad54e..abcf5d4 100644
  [[package]]
  name = "simd_helpers"
  version = "0.1.0"
-@@ -22486,6 +22608,50 @@ dependencies = [
+@@ -22486,6 +22608,54 @@ dependencies = [
   "zed_extension_api 0.7.0",
  ]
  
@@ -250,6 +250,7 @@ index 58ad54e..abcf5d4 100644
 + "feature_flags",
 + "file_finder",
 + "fs",
++ "futures 0.3.32",
 + "go_to_line",
 + "gpui",
 + "gpui_android",
@@ -267,12 +268,15 @@ index 58ad54e..abcf5d4 100644
 + "project",
 + "project_panel",
 + "release_channel",
++ "schemars",
 + "search",
++ "serde",
 + "session",
 + "settings",
 + "tab_switcher",
 + "theme",
 + "theme_settings",
++ "ui",
 + "ui_prompt",
 + "util",
 + "uuid",
